@@ -1,0 +1,75 @@
+# Unity
+Library/
+Temp/
+Logs/
+obj/
+Builds/
+builds/
+CarromBuild/
+UserSettings/
+*.stacktrace
+
+# Generated files
+[Bb]uild/
+[Bb]uilds/
+StreamingAssets/StreamingAssets
+*.unitypackage
+*.apk
+*.aab
+
+# Visual Studio / MonoDevelop / Rider
+.vs/
+.vscode/
+*.csproj
+*.sln
+*.userprefs
+*.sln.meta
+*.csproj.meta
+.metadata/
+ExportedObj/
+obj/
+*.exe
+*.exe.meta
+*.dll
+*.dll.meta
+*.so
+*.so.meta
+*.dylib
+*.dylib.meta
+*.pdb
+*.pdb.meta
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Platform-specific
+Assets/Plugins/*.so
+Assets/Plugins/*.dylib
+Assets/Plugins/x86_64/
+Assets/Plugins/x86/
+
+# Backup files
+*.bak
+*.backup
+*~
+*.tmp
+
+# Project-specific
+*.VC.db
+*.VC.db-shm
+*.VC.db-wal
+builds.zip
