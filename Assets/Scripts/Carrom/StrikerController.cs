@@ -1,22 +1,14 @@
 using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 using Unity.Netcode;
 
 public class StrikerController : NetworkBehaviour
 {
-    [SerializeField]
-    float strikerSpeed = 100f;
-
-    [SerializeField]
-    float maxScale = 1f;
-
-    [SerializeField]
-    Transform strikerForceField;
-
-    [SerializeField]
-    Slider strikerSlider;
+    [SerializeField] float strikerSpeed = 100f;
+    [SerializeField] float maxScale = 1f;
+    [SerializeField] Transform strikerForceField;
+    [SerializeField] Slider strikerSlider;
 
     bool isMoving;
     bool isCharging;
@@ -25,58 +17,100 @@ public class StrikerController : NetworkBehaviour
 
     public static bool playerTurn;
 
+    // -------------------------------------------------------------------------
+    // LIFECYCLE
+    // -------------------------------------------------------------------------
+
     private void Start()
     {
         playerTurn = true;
-        isMoving = false;
-        rb = GetComponent<Rigidbody2D>();
-        
-        // Server-authoritative physics
-        if (IsSpawned && !IsServer)
-        {
-            rb.isKinematic = true;
-            rb.interpolation = RigidbodyInterpolation2D.Interpolate;
-        }
-        else if (IsSpawned && IsServer)
-        {
-            rb.interpolation = RigidbodyInterpolation2D.Interpolate;
-        }
+        rb         = GetComponent<Rigidbody2D>();
+        rb.interpolation = RigidbodyInterpolation2D.Interpolate;
     }
 
+    /// <summary>
+    /// OnEnable delegates entirely to ResetToBaseline so there is one
+    /// canonical reset path used by both initial spawn and turn handoff.
+    /// </summary>
     private void OnEnable()
     {
-        // Determine Y position based on ownership in multiplayer
-        float yPosition = -4.57f; // Default to bottom (local player position)
-        
-        if (IsSpawned)
-        {
-            // In multiplayer, position based on whether this is the local player's striker
-            // Local player's striker always at bottom, opponent's at top
-            yPosition = IsOwner ? -4.57f : 3.45f;
-        }
-        
-        // Reset the position of the striker when it is enabled
-        if (strikerSlider != null && (IsOwner || !IsSpawned))
-        {
-            transform.position = new Vector3(strikerSlider.value, yPosition, 0);
-        }
-        else
-        {
-            transform.position = new Vector3(0, yPosition, 0);
-        }
-        
-        if (strikerForceField != null)
-        {
-            strikerForceField.LookAt(transform.position);
-            strikerForceField.localScale = new Vector3(0, 0, 0);
-        }
-        
-        CollisionSoundManager.shouldBeStatic = true;
+        // rb may not be assigned yet if OnEnable fires before Start (first activation)
+        if (rb == null) rb = GetComponent<Rigidbody2D>();
+        ResetToBaseline();
     }
+
+    /// <summary>
+    /// NGO ownership callback — fires on the NEW owner the moment authority transfers.
+    /// This is the canonical trigger for a turn reset in the single-striker architecture.
+    /// </summary>
+    public override void OnGainedOwnership()
+    {
+        base.OnGainedOwnership();
+        Debug.Log("[StrikerController] Ownership gained — resetting to baseline");
+        ResetToBaseline();
+    }
+
+    // -------------------------------------------------------------------------
+    // RESET — single source of truth for striker ready-state
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Wipes physics state, snaps the striker to the new owner's Y-baseline,
+    /// and broadcasts the position so the spectator sees it immediately.
+    /// </summary>
+    private void ResetToBaseline()
+    {
+        // Wipe physics residuals
+        isMoving   = false;
+        isCharging = false;
+        if (rb != null)
+        {
+            rb.linearVelocity  = Vector2.zero;
+            rb.angularVelocity = 0f;
+        }
+
+        // Hide force field
+        if (strikerForceField != null)
+            strikerForceField.localScale = Vector3.zero;
+
+        CollisionSoundManager.shouldBeStatic = true;
+
+        if (!IsSpawned)
+        {
+            // Single-player: always bottom
+            float x = strikerSlider != null ? strikerSlider.value : 0f;
+            SetPosition(x, -4.57f);
+            return;
+        }
+
+        if (!IsOwner) return; // Non-owners wait for SyncAimClientRpc to move them
+
+        // Host sits at the bottom, Client at the top
+        float y = IsServer ? -4.57f : 3.45f;
+        float sliderX = strikerSlider != null ? strikerSlider.value : 0f;
+        SetPosition(sliderX, y);
+
+        // Broadcast starting position so spectator sees the striker appear at the baseline
+        if (IsServer) SyncAimClientRpc(sliderX, y);
+        else          RequestAimServerRpc(sliderX, y);
+    }
+
+    /// <summary>Moves the striker and keeps the force-field orientation consistent.</summary>
+    private void SetPosition(float x, float y)
+    {
+        transform.position = new Vector3(x, y, 0);
+        if (strikerForceField != null)
+            strikerForceField.LookAt(transform.position);
+    }
+
+    // -------------------------------------------------------------------------
+    // INPUT
+    // -------------------------------------------------------------------------
 
     private void Update()
     {
-        // Check if the striker has come to a near stop and is not moving
+        if (!IsOwner && IsSpawned) return;
+
         if (rb.linearVelocity.magnitude < 0.1f && !isMoving)
         {
             isMoving = true;
@@ -86,69 +120,21 @@ public class StrikerController : NetworkBehaviour
 
     private void OnMouseDown()
     {
-        // In multiplayer, check if this is the correct striker for the current player
-        if (IsSpawned)
-        {
-            CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-            if (gm != null)
-            {
-                // Determine which striker should be active based on turn and player role
-                bool isHostTurn = gm.networkPlayerTurn.Value;
-                bool isPlayerStriker = gameObject == gm.GetPlayerStriker();
-                bool isEnemyStriker = gameObject == gm.GetEnemyStriker();
-                
-                // Host should only control playerStriker on Host's turn
-                // Client should only control enemyStriker on Client's turn
-                if (IsHost)
-                {
-                    if (!isPlayerStriker || !isHostTurn)
-                    {
-                        Debug.Log($"[Network] Host ignoring input - isPlayerStriker: {isPlayerStriker}, isHostTurn: {isHostTurn}");
-                        return;
-                    }
-                }
-                else // IsClient
-                {
-                    if (!isEnemyStriker || isHostTurn)
-                    {
-                        Debug.Log($"[Network] Client ignoring input - isEnemyStriker: {isEnemyStriker}, isHostTurn: {isHostTurn}");
-                        return;
-                    }
-                }
-            }
-        }
-        
-        // If the striker is moving, disable charging and return
+        if (!IsOwner && IsSpawned) return;
+
         if (rb.linearVelocity.magnitude > 0.1f)
         {
             isCharging = false;
             return;
         }
 
-        // Determine correct Y position based on which striker this is
-        float correctYPosition = -4.57f; // Default to bottom
-        if (IsSpawned)
-        {
-            CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-            if (gm != null)
-            {
-                // Host's playerStriker at bottom, enemyStriker at top
-                // Client's enemyStriker at bottom, playerStriker at top
-                bool isPlayerStriker = gameObject == gm.GetPlayerStriker();
-                correctYPosition = (IsHost && isPlayerStriker) || (!IsHost && !isPlayerStriker) ? -4.57f : 3.45f;
-            }
-        }
-        
-        // Reset the position of the striker if it is not at the correct y-axis position
-        if (transform.position.y != correctYPosition)
-        {
-            transform.position = new Vector3(0, correctYPosition, 0);
-        }
+        // Snap to correct Y if drifted
+        float correctY = (!IsSpawned || IsServer) ? -4.57f : 3.45f;
+        if (Mathf.Abs(transform.position.y - correctY) > 0.01f)
+            transform.position = new Vector3(transform.position.x, correctY, 0);
 
-        // Enable charging and show the striker force field
         isCharging = true;
         strikerForceField.gameObject.SetActive(true);
-        Debug.Log("[Network] Striker charging started");
     }
 
     private IEnumerator OnMouseUp()
@@ -156,200 +142,119 @@ public class StrikerController : NetworkBehaviour
         isMoving = true;
         yield return new WaitForSeconds(0.1f);
 
-        // If charging is not enabled, exit the coroutine
-        if (!isCharging)
-        {
-            yield break;
-        }
+        if (!isCharging) yield break;
 
         strikerForceField.gameObject.SetActive(false);
         isCharging = false;
         yield return new WaitForSeconds(0.1f);
 
-        // Calculate the direction and magnitude of the force based on the mouse position
         Vector3 direction = transform.position - Camera.main.ScreenToWorldPoint(Input.mousePosition);
         direction.z = 0f;
-        float forceMagnitude = direction.magnitude * strikerSpeed;
-        forceMagnitude = Mathf.Clamp(forceMagnitude, 0f, maxForceMagnitude);
+        float forceMagnitude = Mathf.Clamp(direction.magnitude * strikerSpeed, 0f, maxForceMagnitude);
 
-        // In multiplayer, server applies physics
         if (IsSpawned)
         {
-            if (IsServer)
-            {
-                // Host applies force directly
-                rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
-                CollisionSoundManager.shouldBeStatic = false;
-            }
-            else
-            {
-                // Client sends request to server
-                RequestStrikerShootServerRpc(direction, forceMagnitude);
-            }
+            CarromGameManager gm = FindObjectOfType<CarromGameManager>();
+            // Active player calls OnShotStart locally — recording runs on the owner's machine
+            if (gm != null) gm.OnShotStart();
+
+            rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
+            CollisionSoundManager.shouldBeStatic = false;
         }
         else
         {
-            // Single-player mode
             rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
             CollisionSoundManager.shouldBeStatic = false;
         }
 
         yield return new WaitForSeconds(0.1f);
-
-        // Wait until the striker comes to a near stop
         yield return new WaitUntil(() => rb.linearVelocity.magnitude < 0.1f);
 
-        // Wait for all objects to stop moving before switching turn
-        CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-        if (gm != null)
-        {
-            yield return new WaitUntil(() => gm.AreAllObjectsStopped());
-        }
+        CarromGameManager gm2 = FindObjectOfType<CarromGameManager>();
+        if (gm2 != null)
+            yield return new WaitUntil(() => gm2.AreAllObjectsStopped());
 
         isMoving = false;
-        
-        // Switch turn
+
         if (IsSpawned)
         {
-            if (IsServer && gm != null)
-            {
-                gm.SwitchTurn();
-            }
+            // Active player calls OnShotComplete locally — recording stops on the owner's machine
+            if (gm2 != null) gm2.OnShotComplete();
         }
         else
         {
             playerTurn = false;
         }
-        
-        gameObject.SetActive(false);
+
+        // Single-player turn flip — striker stays active in multiplayer
+        if (!IsSpawned)
+            gameObject.SetActive(false);
     }
 
     private void OnMouseDrag()
     {
-        // If charging is not enabled, return
-        if (!isCharging)
-        {
-            return;
-        }
+        if (!IsOwner && IsSpawned) return;
+        if (!isCharging) return;
 
-        // Update the direction and scale of the striker force field based on the mouse position
         Vector3 direction = transform.position - Camera.main.ScreenToWorldPoint(Input.mousePosition);
         direction.z = 0f;
         strikerForceField.LookAt(transform.position + direction);
 
-        float scaleValue = Vector3.Distance(transform.position, transform.position + direction / 4f);
-
-        if (scaleValue > maxScale)
-        {
-            scaleValue = maxScale;
-        }
-
+        float scaleValue = Mathf.Min(
+            Vector3.Distance(transform.position, transform.position + direction / 4f),
+            maxScale);
         strikerForceField.localScale = new Vector3(scaleValue, scaleValue, scaleValue);
     }
 
+    // -------------------------------------------------------------------------
+    // SLIDER AIM
+    // -------------------------------------------------------------------------
+
     public void SetSliderX()
     {
-        // Set the X position of the striker based on the slider value
-        if (strikerSlider == null)
-        {
-            Debug.LogWarning("[Network] strikerSlider is null, cannot set position");
-            return;
-        }
-        
+        if (!IsOwner && IsSpawned) return;
+        if (strikerSlider == null) return;
+
         if (rb.linearVelocity.magnitude < 0.1f)
         {
-            // Determine correct Y position based on ownership
-            float yPosition = (IsSpawned && !IsOwner) ? 3.45f : -4.57f;
-            
-            float newX = strikerSlider.value;
-            transform.position = new Vector3(newX, yPosition, 0);
-            
-            // In multiplayer, sync position to server
-            if (IsSpawned && !IsServer)
+            float y = (!IsSpawned || IsServer) ? -4.57f : 3.45f;
+            float x = strikerSlider.value;
+            transform.position = new Vector3(x, y, 0);
+
+            if (IsSpawned)
             {
-                RequestStrikerPositionServerRpc(newX);
+                if (IsServer) SyncAimClientRpc(x, y);
+                else          RequestAimServerRpc(x, y);
             }
         }
     }
 
-    private void OnCollisionEnter2D(Collision2D other)
-    {
-        // Play the collision sound if the striker collides with the board
-        if (other.gameObject.CompareTag("Board"))
-        {
-            // GetComponent<AudioSource>().Play();
-        }
-    }
+    // -------------------------------------------------------------------------
+    // RPCs
+    // -------------------------------------------------------------------------
+
     [ServerRpc(RequireOwnership = false)]
-    private void RequestStrikerPositionServerRpc(float xPosition, ServerRpcParams rpcParams = default)
+    private void RequestAimServerRpc(float x, float y, ServerRpcParams rpcParams = default)
     {
-        // Validate position is within bounds
-        if (xPosition < -3f || xPosition > 3f)
-        {
-            Debug.LogWarning($"[Network] Invalid striker position: {xPosition}");
-            return;
-        }
+        if (x < -3f || x > 3f) return;
+        transform.position = new Vector3(x, y, 0);
+        SyncAimClientRpc(x, y);
+    }
 
-        // Determine correct Y position based on ownership
-        float yPosition = IsOwner ? -4.57f : 3.45f;
-
-        // Update striker position
-        transform.position = new Vector3(xPosition, yPosition, 0);
-        Debug.Log($"[Network] Striker position updated to: {xPosition}");
+    [ClientRpc]
+    private void SyncAimClientRpc(float x, float y)
+    {
+        if (IsOwner) return;
+        transform.position = new Vector3(x, y, 0);
     }
 
     [ServerRpc(RequireOwnership = false)]
-    private void RequestStrikerShootServerRpc(Vector3 direction, float forceMagnitude, ServerRpcParams rpcParams = default)
+    private void NotifyServerShotCompleteServerRpc(ServerRpcParams rpcParams = default)
     {
-        ulong senderId = rpcParams.Receive.SenderClientId;
-
-        // Validate it's the player's turn
         CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-        if (gm != null)
-        {
-            bool isHostTurn = gm.networkPlayerTurn.Value;
-            bool senderIsHost = senderId == NetworkManager.Singleton.LocalClientId;
-
-            if (isHostTurn != senderIsHost)
-            {
-                Debug.LogWarning($"[Network] Invalid shot request from {senderId} - not their turn");
-                return;
-            }
-        }
-
-        // Validate force magnitude
-        if (forceMagnitude < 0 || forceMagnitude > maxForceMagnitude)
-        {
-            Debug.LogWarning($"[Network] Invalid force magnitude: {forceMagnitude}");
-            return;
-        }
-
-        // Apply force to striker on server
-        rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
-        CollisionSoundManager.shouldBeStatic = false;
-        
-        // Start coroutine on server to wait for movement to stop and switch turn
-        StartCoroutine(WaitForShotCompleteAndSwitchTurn());
-    }
-    
-    private IEnumerator WaitForShotCompleteAndSwitchTurn()
-    {
-        // Wait until the striker comes to a near stop
-        yield return new WaitUntil(() => rb.linearVelocity.magnitude < 0.1f);
-
-        // Wait for all objects to stop moving before switching turn
-        CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-        if (gm != null)
-        {
-            yield return new WaitUntil(() => gm.AreAllObjectsStopped());
-            
-            // Switch turn on server
-            gm.SwitchTurn();
-            Debug.Log("[Network] Turn switched after client shot");
-        }
-        
-        // Deactivate striker
-        gameObject.SetActive(false);
+        if (gm != null) gm.OnShotComplete();
+        // No SetActive(false) — single striker stays alive, OnGainedOwnership resets it
     }
 
+    private void OnCollisionEnter2D(Collision2D other) { }
 }

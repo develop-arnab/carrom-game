@@ -5,72 +5,51 @@ using TMPro;
 using UnityEngine.SceneManagement;
 using Unity.Netcode;
 
-// Enum for game over results
-public enum GameResult
-{
-    HostWins,
-    ClientWins,
-    Draw
-}
+public enum GameResult { HostWins, ClientWins, Draw }
 
 public class CarromGameManager : NetworkBehaviour
 {
-    // Network variables for multiplayer synchronization
-    public NetworkVariable<int> networkScorePlayer = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-    public NetworkVariable<int> networkScoreEnemy = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-    public NetworkVariable<float> networkTimeLeft = new NetworkVariable<float>(120f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-    public NetworkVariable<bool> networkPlayerTurn = new NetworkVariable<bool>(true, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-    
+    public NetworkVariable<int>   networkScorePlayer = new NetworkVariable<int>(0,     NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    public NetworkVariable<int>   networkScoreEnemy  = new NetworkVariable<int>(0,     NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    public NetworkVariable<float> networkTimeLeft    = new NetworkVariable<float>(120f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    public NetworkVariable<bool>  networkPlayerTurn  = new NetworkVariable<bool>(true,  NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
     bool gameOver = false;
     bool isPaused = false;
 
-    // TextMeshProUGUI variables for displaying scores, game over text, and instructions.
-    [SerializeField]
-    TextMeshProUGUI scoreTextEnemy;
+    [SerializeField] TextMeshProUGUI scoreTextEnemy;
+    [SerializeField] TextMeshProUGUI scoreTextPlayer;
+    [SerializeField] TextMeshProUGUI gameOverText;
+    [SerializeField] TextMeshProUGUI instructionsText;
+
+    [SerializeField] GameObject instructionsMenu;
+    [SerializeField] GameObject pauseMenu;
+    [SerializeField] GameObject gameOverMenu;
+    [SerializeField] GameObject activeStriker;
+    [SerializeField] GameObject turnText;
+    [SerializeField] GameObject slider;
+    [SerializeField] Animator   animator;
+
+    [Header("Telemetry System")]
+    [SerializeField] private TelemetryRecorder              telemetryRecorder;
+    [SerializeField] private BatchTransmitter               batchTransmitter;
+    [SerializeField] private PieceRegistry                  pieceRegistry;
+    [SerializeField] private Carrom.Telemetry.PlaybackEngine playbackEngine;
 
     [SerializeField]
-    TextMeshProUGUI scoreTextPlayer;
-
-    [SerializeField]
-    TextMeshProUGUI gameOverText;
-
-    [SerializeField]
-    TextMeshProUGUI instructionsText;
-
-    // Game object variables for menus, strikers, turn text, and a slider.
-    [SerializeField]
-    GameObject instructionsMenu;
-
-    [SerializeField]
-    GameObject pauseMenu;
-
-    [SerializeField]
-    GameObject gameOverMenu;
-
-    [SerializeField]
-    GameObject playerStriker;
-
-    [SerializeField]
-    GameObject enemyStriker;
-
-    [SerializeField]
-    GameObject turnText;
-
-    [SerializeField]
-    GameObject slider;
-
-    [SerializeField]
-    Animator animator;
+    [Tooltip("Minimum velocity magnitude for a piece to be considered moving")]
+    private float velocityThreshold = 0.1f;
 
     TimerScript timerScript;
-
     private const string FirstTimeLaunchKey = "FirstTimeLaunch";
+
+    // -------------------------------------------------------------------------
+    // UNITY LIFECYCLE
+    // -------------------------------------------------------------------------
 
     void Awake()
     {
         timerScript = GetComponent<TimerScript>();
-
-        // Check if it's the first time launching the game.
         if (PlayerPrefs.GetInt(FirstTimeLaunchKey, 0) == 0)
         {
             timerScript.isTimerRunning = false;
@@ -88,202 +67,131 @@ public class CarromGameManager : NetworkBehaviour
     void Start()
     {
         Time.timeScale = 1;
-        
-        // Initialize scores
         if (IsServer)
         {
-            networkScoreEnemy.Value = 0;
+            networkScoreEnemy.Value  = 0;
             networkScorePlayer.Value = 0;
-            networkTimeLeft.Value = 120f;
-            networkPlayerTurn.Value = true; // Host takes first turn
+            networkTimeLeft.Value    = 120f;
+            networkPlayerTurn.Value  = true;
         }
-        
-        // Also initialize static fields for backward compatibility
-        BoardScript.scoreEnemy = 0;
+        BoardScript.scoreEnemy  = 0;
         BoardScript.scorePlayer = 0;
+
+        if (batchTransmitter != null)
+            batchTransmitter.SetCarromGameManager(this);
+    }
+
+    public override void OnNetworkSpawn()
+    {
+        base.OnNetworkSpawn();
+        if (IsServer)
+            StartCoroutine(SendInitialBoardStateDelayed());
+    }
+
+    private IEnumerator SendInitialBoardStateDelayed()
+    {
+        yield return null; // let PieceRegistry.Start() register pieces
+        EndStatePayload payload = ConstructEndState();
+        SyncInitialBoardStateClientRpc(payload);
+        Debug.Log($"[CarromGameManager] Initial board state synced — {payload.pieceCount} pieces");
+    }
+
+    [ClientRpc]
+    private void SyncInitialBoardStateClientRpc(EndStatePayload payload)
+    {
+        if (IsServer) return;
+        playbackEngine?.ApplyEndState(payload);
+        Debug.Log("[CarromGameManager] CLIENT: Initial board state applied");
     }
 
     void Update()
     {
-        // Determine current turn state
-        bool isPlayerTurnActive;
-        if (IsSpawned)
-        {
-            // In multiplayer, use network variable
-            // Host's turn = networkPlayerTurn is true
-            // Client's turn = networkPlayerTurn is false
-            isPlayerTurnActive = IsHost ? networkPlayerTurn.Value : !networkPlayerTurn.Value;
-            
-            // In multiplayer, playerStriker is the local player's striker
-            // enemyStriker is the opponent's striker
-            // Host controls playerStriker (HostStriker), Client controls enemyStriker (ClientStriker)
-            GameObject myStriker = IsHost ? playerStriker : enemyStriker;
-            GameObject opponentStriker = IsHost ? enemyStriker : playerStriker;
-            
-            // Update UI based on turn state
-            if (isPlayerTurnActive)
-            {
-                if (slider != null) slider.SetActive(true);
-                if (turnText != null) turnText.SetActive(true);
-                if (myStriker != null) myStriker.SetActive(true);
-                if (opponentStriker != null) opponentStriker.SetActive(false);
-            }
-            else
-            {
-                if (slider != null) slider.SetActive(false);
-                if (turnText != null) turnText.SetActive(false);
-                if (myStriker != null) myStriker.SetActive(false);
-                if (opponentStriker != null) opponentStriker.SetActive(true);
-            }
-        }
-        else
-        {
-            // Single-player mode
-            isPlayerTurnActive = StrikerController.playerTurn;
-            
-            if (isPlayerTurnActive)
-            {
-                if (slider != null) slider.SetActive(true);
-                if (turnText != null) turnText.SetActive(true);
-                if (playerStriker != null) playerStriker.SetActive(true);
-                if (enemyStriker != null) enemyStriker.SetActive(false);
-            }
-            else
-            {
-                if (slider != null) slider.SetActive(false);
-                if (turnText != null) turnText.SetActive(false);
-                if (playerStriker != null) playerStriker.SetActive(false);
-                if (enemyStriker != null) enemyStriker.SetActive(true);
-            }
-        }
+        bool isPlayerTurnActive = IsSpawned
+            ? (IsHost ? networkPlayerTurn.Value : !networkPlayerTurn.Value)
+            : StrikerController.playerTurn;
 
-        // Check game over conditions
-        int currentScoreEnemy = IsSpawned ? networkScoreEnemy.Value : BoardScript.scoreEnemy;
-        int currentScorePlayer = IsSpawned ? networkScorePlayer.Value : BoardScript.scorePlayer;
-        float currentTimeLeft = IsSpawned ? networkTimeLeft.Value : timerScript.timeLeft;
-        
+        if (slider   != null) slider.SetActive(isPlayerTurnActive);
+        if (turnText != null) turnText.SetActive(isPlayerTurnActive);
+
+        int   currentScoreEnemy  = IsSpawned ? networkScoreEnemy.Value  : BoardScript.scoreEnemy;
+        int   currentScorePlayer = IsSpawned ? networkScorePlayer.Value : BoardScript.scorePlayer;
+        float currentTimeLeft    = IsSpawned ? networkTimeLeft.Value    : timerScript.timeLeft;
+
         if (currentScoreEnemy >= 8 || currentScorePlayer >= 8 || currentTimeLeft <= 0)
-        {
-            // Only Host triggers game over in multiplayer
-            if (!IsSpawned || IsServer)
-            {
-                onGameOver();
-            }
-        }
+            if (!IsSpawned || IsServer) onGameOver();
 
         if (Input.GetKeyDown(KeyCode.Escape) && !gameOver)
         {
-            if (isPaused)
-            {
-                ResumeGame();
-            }
-            else
-            {
-                PauseGame();
-            }
+            if (isPaused) ResumeGame(); else PauseGame();
         }
     }
 
     private void LateUpdate()
     {
-        if (!gameOver)
+        if (gameOver) return;
+        if (IsSpawned)
         {
-            // Read from network variables if in multiplayer, otherwise use static fields
-            if (IsSpawned)
-            {
-                scoreTextEnemy.text = networkScoreEnemy.Value.ToString();
-                scoreTextPlayer.text = networkScorePlayer.Value.ToString();
-            }
-            else
-            {
-                scoreTextEnemy.text = BoardScript.scoreEnemy.ToString();
-                scoreTextPlayer.text = BoardScript.scorePlayer.ToString();
-            }
-        }
-    }
-
-    IEnumerator playAnimation()
-    {
-        animator.SetTrigger("fade");
-        yield return new WaitForSeconds(1f);
-    }
-
-    void onGameOver()
-    {
-        // In multiplayer, only Host triggers game over
-        if (IsSpawned && !IsServer)
-        {
-            return;
-        }
-        
-        // Calculate game result
-        GameResult result;
-        int hostScore = IsSpawned ? networkScorePlayer.Value : BoardScript.scorePlayer;
-        int clientScore = IsSpawned ? networkScoreEnemy.Value : BoardScript.scoreEnemy;
-        
-        if (hostScore > clientScore)
-        {
-            result = GameResult.HostWins;
-        }
-        else if (clientScore > hostScore)
-        {
-            result = GameResult.ClientWins;
+            scoreTextEnemy.text  = networkScoreEnemy.Value.ToString();
+            scoreTextPlayer.text = networkScorePlayer.Value.ToString();
         }
         else
         {
-            result = GameResult.Draw;
+            scoreTextEnemy.text  = BoardScript.scoreEnemy.ToString();
+            scoreTextPlayer.text = BoardScript.scorePlayer.ToString();
         }
-        
-        // In multiplayer, broadcast to all clients
+    }
+
+    // -------------------------------------------------------------------------
+    // GAME OVER
+    // -------------------------------------------------------------------------
+
+    IEnumerator playAnimation() { animator.SetTrigger("fade"); yield return new WaitForSeconds(1f); }
+
+    void onGameOver()
+    {
+        if (IsSpawned && !IsServer) return;
+
+        int hostScore   = IsSpawned ? networkScorePlayer.Value : BoardScript.scorePlayer;
+        int clientScore = IsSpawned ? networkScoreEnemy.Value  : BoardScript.scoreEnemy;
+
+        GameResult result = hostScore > clientScore ? GameResult.HostWins
+                          : clientScore > hostScore ? GameResult.ClientWins
+                          : GameResult.Draw;
+
         if (IsSpawned)
         {
             ShowGameOverClientRpc(result);
         }
         else
         {
-            // Single-player fallback
             gameOver = true;
             gameOverMenu.SetActive(true);
             Time.timeScale = 0;
-            if (BoardScript.scoreEnemy > BoardScript.scorePlayer)
-            {
-                gameOverText.text = "You Lose!";
-            }
-            else if (BoardScript.scoreEnemy < BoardScript.scorePlayer)
-            {
-                gameOverText.text = "You Win!";
-            }
-            else
-            {
-                gameOverText.text = "Draw!";
-            }
+            gameOverText.text = BoardScript.scoreEnemy > BoardScript.scorePlayer ? "You Lose!"
+                              : BoardScript.scoreEnemy < BoardScript.scorePlayer ? "You Win!"
+                              : "Draw!";
         }
     }
 
-    public void ResumeGame()
+    [ClientRpc]
+    private void ShowGameOverClientRpc(GameResult result)
     {
-        isPaused = false;
-        pauseMenu.SetActive(false);
-        Time.timeScale = 1;
-    }
-
-    public void PauseGame()
-    {
-        isPaused = true;
-        pauseMenu.SetActive(true);
+        gameOver = true;
+        gameOverMenu.SetActive(true);
         Time.timeScale = 0;
+        gameOverText.text = result == GameResult.HostWins   ? (IsHost ? "You Win!"  : "You Lose!")
+                          : result == GameResult.ClientWins ? (IsHost ? "You Lose!" : "You Win!")
+                          : "Draw!";
     }
 
-    public void RestartGame()
-    {
-        SceneManager.LoadScene(1);
-    }
+    // -------------------------------------------------------------------------
+    // MENUS
+    // -------------------------------------------------------------------------
 
-    public void QuitGame()
-    {
-        StartCoroutine(playAnimation());
-        SceneManager.LoadScene(0);
-    }
+    public void ResumeGame()  { isPaused = false; pauseMenu.SetActive(false); Time.timeScale = 1; }
+    public void PauseGame()   { isPaused = true;  pauseMenu.SetActive(true);  Time.timeScale = 0; }
+    public void RestartGame() { SceneManager.LoadScene(1); }
+    public void QuitGame()    { StartCoroutine(playAnimation()); SceneManager.LoadScene(0); }
 
     public void NextPage()
     {
@@ -295,109 +203,191 @@ public class CarromGameManager : NetworkBehaviour
             instructionsMenu.SetActive(false);
         }
     }
-    [ClientRpc]
-    private void ShowGameOverClientRpc(GameResult result)
+
+    // -------------------------------------------------------------------------
+    // PHYSICS QUERY
+    // -------------------------------------------------------------------------
+
+    public bool AreAllObjectsStopped()
     {
-        gameOver = true;
-        gameOverMenu.SetActive(true);
-        Time.timeScale = 0;
+        string[] tags = { "Black", "White", "Queen", "Striker" };
+        foreach (string tag in tags)
+            foreach (GameObject go in GameObject.FindGameObjectsWithTag(tag))
+            {
+                Rigidbody2D rb = go.GetComponent<Rigidbody2D>();
+                if (rb != null && rb.linearVelocity.magnitude >= velocityThreshold) return false;
+            }
+        return true;
+    }
 
-        switch (result)
-        {
-            case GameResult.HostWins:
-                gameOverText.text = IsHost ? "You Win!" : "You Lose!";
-                break;
-            case GameResult.ClientWins:
-                gameOverText.text = IsHost ? "You Lose!" : "You Win!";
-                break;
-            case GameResult.Draw:
-                gameOverText.text = "Draw!";
-                break;
-        }
+    // -------------------------------------------------------------------------
+    // SHOT LIFECYCLE — runs on the ACTIVE PLAYER (owner), not server-only
+    // -------------------------------------------------------------------------
 
-        Debug.Log($"[Network] Game Over - Result: {result}");
+    /// <summary>
+    /// Called locally by the active player (Host OR Client) the moment they shoot.
+    /// Starts telemetry recording on the machine that owns the physics.
+    /// Notifies BatchTransmitter to freeze the spectator's pieces.
+    /// </summary>
+    public void OnShotStart()
+    {
+        if (!IsSpawned) return;
+
+        Debug.Log($"[CarromGameManager] ===== SHOT START (IsServer={IsServer}) =====");
+
+        telemetryRecorder?.StartRecording();
+
+        // BatchTransmitter.NotifyShotStart must run on the server to send RPCs.
+        // If we are the server (Host shooting), call directly.
+        // If we are the client, ask the server to broadcast the freeze.
+        if (IsServer)
+            batchTransmitter?.NotifyShotStart();
+        else
+            batchTransmitter?.RequestShotStartServerRpc();
+    }
+
+    /// <summary>
+    /// Called locally by the active player when all pieces have stopped.
+    /// Stops recording, builds the end state, and transmits the replay to the peer.
+    /// Turn flip happens ONLY inside TransferAuthority at the very end of the cycle.
+    /// </summary>
+    public void OnShotComplete()
+    {
+        if (!IsSpawned) return;
+
+        Debug.Log($"[CarromGameManager] ===== SHOT COMPLETE (IsServer={IsServer}) =====");
+
+        telemetryRecorder?.StopRecording();
+
+        EndStatePayload endState = ConstructEndState();
+        batchTransmitter?.TransmitFullReplay(endState);
+    }
+
+    // -------------------------------------------------------------------------
+    // TURN & AUTHORITY
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Flips networkPlayerTurn. Only callable on server.
+    /// Called inside TransferAuthority so the flip happens at the very end of the cycle.
+    /// </summary>
+    private void FlipTurn()
+    {
+        if (!IsServer) return;
+        networkPlayerTurn.Value = !networkPlayerTurn.Value;
+        UpdateTurnDisplayClientRpc(networkPlayerTurn.Value);
+        Debug.Log($"[CarromGameManager] Turn flipped — networkPlayerTurn={networkPlayerTurn.Value}");
     }
 
     [ClientRpc]
     private void UpdateTurnDisplayClientRpc(bool isPlayerTurn)
     {
-        Debug.Log($"[Network] Turn updated - Player turn: {isPlayerTurn}");
-        // Turn display will be updated in Update() based on networkPlayerTurn
+        Debug.Log($"[CarromGameManager] Turn display updated — {isPlayerTurn}");
     }
-    // Check if all game objects have stopped moving
-    public bool AreAllObjectsStopped()
+
+    public GameObject GetActiveStriker() => activeStriker;
+
+    /// <summary>
+    /// Returns the client ID of the player whose turn it currently is.
+    /// Reads networkPlayerTurn which reflects the CURRENT (not next) turn.
+    /// </summary>
+    public ulong GetActivePlayerClientId()
     {
-        GameObject[] coins = GameObject.FindGameObjectsWithTag("Black");
-        GameObject[] whiteCoins = GameObject.FindGameObjectsWithTag("White");
-        GameObject[] queens = GameObject.FindGameObjectsWithTag("Queen");
-        GameObject[] strikers = GameObject.FindGameObjectsWithTag("Striker");
-
-        // Check all coins
-        foreach (GameObject coin in coins)
-        {
-            Rigidbody2D rb = coin.GetComponent<Rigidbody2D>();
-            if (rb != null && rb.linearVelocity.magnitude >= 0.1f)
-            {
-                return false;
-            }
-        }
-
-        foreach (GameObject coin in whiteCoins)
-        {
-            Rigidbody2D rb = coin.GetComponent<Rigidbody2D>();
-            if (rb != null && rb.linearVelocity.magnitude >= 0.1f)
-            {
-                return false;
-            }
-        }
-
-        foreach (GameObject queen in queens)
-        {
-            Rigidbody2D rb = queen.GetComponent<Rigidbody2D>();
-            if (rb != null && rb.linearVelocity.magnitude >= 0.1f)
-            {
-                return false;
-            }
-        }
-
-        foreach (GameObject striker in strikers)
-        {
-            Rigidbody2D rb = striker.GetComponent<Rigidbody2D>();
-            if (rb != null && rb.linearVelocity.magnitude >= 0.1f)
-            {
-                return false;
-            }
-        }
-
-        return true;
+        if (!IsSpawned) return ulong.MaxValue;
+        // GetCurrentActivePlayerId requires IsServer — call via server path only
+        if (IsServer) return GetCurrentActivePlayerId();
+        // On client, derive from networkPlayerTurn
+        bool myTurn = !networkPlayerTurn.Value; // client's turn when networkPlayerTurn=false
+        return myTurn ? NetworkManager.Singleton.LocalClientId : ulong.MaxValue;
     }
 
-    // Switch turn to the other player
+    public void TriggerAuthorityTransfer() => TransferAuthority();
+
+    private void TransferAuthority()
+    {
+        if (!IsSpawned || !IsServer) return;
+
+        // Flip the turn NOW — at the very end of the cycle
+        FlipTurn();
+
+        ulong newActivePlayerId = GetCurrentActivePlayerId();
+        if (newActivePlayerId == ulong.MaxValue)
+        {
+            Debug.LogWarning("[CarromGameManager] Could not determine next active player");
+            return;
+        }
+
+        List<GameObject> pieceList = new List<GameObject>();
+        pieceList.AddRange(GameObject.FindGameObjectsWithTag("Black"));
+        pieceList.AddRange(GameObject.FindGameObjectsWithTag("White"));
+        pieceList.AddRange(GameObject.FindGameObjectsWithTag("Queen"));
+        pieceList.AddRange(GameObject.FindGameObjectsWithTag("Striker"));
+
+        int transferred = 0;
+        foreach (GameObject piece in pieceList)
+        {
+            NetworkObject no = piece.GetComponent<NetworkObject>();
+            if (no != null && no.IsSpawned) { no.ChangeOwnership(newActivePlayerId); transferred++; }
+        }
+
+        Debug.Log($"[CarromGameManager] Authority → client {newActivePlayerId} ({transferred} pieces)");
+        NotifyAuthorityChangeClientRpc(newActivePlayerId);
+    }
+
+    [ClientRpc]
+    private void NotifyAuthorityChangeClientRpc(ulong newActivePlayerId)
+    {
+        bool isNewActivePlayer = NetworkManager.Singleton.LocalClientId == newActivePlayerId;
+        List<GameObject> pieceList = new List<GameObject>();
+        pieceList.AddRange(GameObject.FindGameObjectsWithTag("Black"));
+        pieceList.AddRange(GameObject.FindGameObjectsWithTag("White"));
+        pieceList.AddRange(GameObject.FindGameObjectsWithTag("Queen"));
+        pieceList.AddRange(GameObject.FindGameObjectsWithTag("Striker"));
+        foreach (GameObject piece in pieceList)
+            piece.GetComponent<NetworkPhysicsObject>()?.SetAuthority(isNewActivePlayer);
+    }
+
+    private ulong GetCurrentActivePlayerId()
+    {
+        if (!IsServer) return ulong.MaxValue;
+        bool currentTurnIsHost = networkPlayerTurn.Value;
+        foreach (var clientId in NetworkManager.Singleton.ConnectedClientsIds)
+        {
+            bool isHostClient = clientId == NetworkManager.Singleton.LocalClientId;
+            if (currentTurnIsHost && isHostClient)  return clientId;
+            if (!currentTurnIsHost && !isHostClient) return clientId;
+        }
+        return ulong.MaxValue;
+    }
+
+    // -------------------------------------------------------------------------
+    // END STATE
+    // -------------------------------------------------------------------------
+
+    public EndStatePayload ConstructEndState()
+    {
+        EndStatePayload payload = new EndStatePayload(maxPieces: 20);
+        if (pieceRegistry == null) { Debug.LogError("[CarromGameManager] PieceRegistry is null"); return payload; }
+
+        for (byte id = 0; id < 20; id++)
+        {
+            GameObject piece = pieceRegistry.GetPiece(id);
+            if (piece == null) continue;
+            payload.finalStates[payload.pieceCount++] = new PieceState
+            {
+                pieceId   = id,
+                xPosition = piece.transform.position.x,
+                yPosition = piece.transform.position.y,
+                zRotation = piece.transform.eulerAngles.z
+            };
+        }
+        Debug.Log($"[CarromGameManager] End state built — {payload.pieceCount} pieces");
+        return payload;
+    }
+
+    // Single-player legacy
     public void SwitchTurn()
     {
-        if (IsSpawned && IsServer)
-        {
-            networkPlayerTurn.Value = !networkPlayerTurn.Value;
-            UpdateTurnDisplayClientRpc(networkPlayerTurn.Value);
-            Debug.Log($"[Network] Turn switched - Player turn: {networkPlayerTurn.Value}");
-        }
-        else if (!IsSpawned)
-        {
-            // Single-player mode
-            StrikerController.playerTurn = !StrikerController.playerTurn;
-        }
+        if (!IsSpawned) StrikerController.playerTurn = !StrikerController.playerTurn;
     }
-    
-    // Helper methods to get striker references
-    public GameObject GetPlayerStriker()
-    {
-        return playerStriker;
-    }
-    
-    public GameObject GetEnemyStriker()
-    {
-        return enemyStriker;
-    }
-
-
 }
