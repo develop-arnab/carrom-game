@@ -16,6 +16,7 @@ GameObject:
   - component: {fileID: 4596925443409670175}
   - component: {fileID: 5464207536859244010}
   - component: {fileID: 5501336343142531255}
+  - component: {fileID: 6455927736887719356}
   m_Layer: 0
   m_Name: White
   m_TagString: White
@@ -303,3 +304,23 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ShowTopMostFoldoutHeaderGroup: 1
+--- !u!114 &6455927736887719356
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 44670815661185188}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b68b1792359765347a8571b901bccb0f, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  slidingClip: {fileID: 8300000, guid: 978e7c02c7a132c459a4343e9d8fef53, type: 3}
+  minSpeed: 0.3
+  maxSpeed: 20
+  maxVolume: 1
+  volumeLerpSpeed: 10
+  minPitch: 0.8
+  maxPitch: 1.6
+  pitchLerpSpeed: 6

@@ -118,22 +118,28 @@ public class BatchTransmitter : NetworkBehaviour
             System.Array.Copy(allFrames, start, chunk, 0, count);
 
             if (IsServer)
-                // Host → Client
                 DeliverChunkToClientClientRpc(chunk, i, totalChunks);
             else
-                // Client → Host
                 DeliverChunkToServerServerRpc(chunk, i, totalChunks);
 
             Debug.Log($"[BatchTransmitter] Sent chunk {i + 1}/{totalChunks} ({count} frames)");
             yield return null;
         }
 
+        // Send audio track before end state so PlaybackEngine has it ready
+        ReplayAudioEvent[] audioTrack = telemetryRecorder.GetAudioTrack();
         if (IsServer)
+        {
+            DeliverAudioTrackToClientClientRpc(audioTrack);
             DeliverEndStateToClientClientRpc(endState);
+        }
         else
+        {
+            DeliverAudioTrackToServerServerRpc(audioTrack);
             DeliverEndStateToServerServerRpc(endState);
+        }
 
-        Debug.Log("[BatchTransmitter] All chunks + end state transmitted.");
+        Debug.Log($"[BatchTransmitter] Audio track ({audioTrack.Length} events) + end state transmitted.");
     }
 
     // -------------------------------------------------------------------------
@@ -143,9 +149,17 @@ public class BatchTransmitter : NetworkBehaviour
     [ClientRpc]
     private void DeliverChunkToClientClientRpc(PhysicsFrame[] chunkFrames, int chunkIndex, int totalChunks)
     {
-        if (IsServer) return; // Host sent this — only Client receives
+        if (IsServer) return;
         Debug.Log($"[BatchTransmitter] CLIENT received chunk {chunkIndex + 1}/{totalChunks}");
         playbackEngine?.ReceiveChunk(chunkFrames, chunkIndex, totalChunks);
+    }
+
+    [ClientRpc]
+    private void DeliverAudioTrackToClientClientRpc(ReplayAudioEvent[] audioTrack)
+    {
+        if (IsServer) return;
+        Debug.Log($"[BatchTransmitter] CLIENT received audio track ({audioTrack.Length} events)");
+        playbackEngine?.ReceiveAudioTrack(audioTrack);
     }
 
     [ClientRpc]
@@ -165,6 +179,13 @@ public class BatchTransmitter : NetworkBehaviour
     {
         Debug.Log($"[BatchTransmitter] HOST received chunk {chunkIndex + 1}/{totalChunks}");
         playbackEngine?.ReceiveChunk(chunkFrames, chunkIndex, totalChunks);
+    }
+
+    [ServerRpc(RequireOwnership = false)]
+    private void DeliverAudioTrackToServerServerRpc(ReplayAudioEvent[] audioTrack, ServerRpcParams _ = default)
+    {
+        Debug.Log($"[BatchTransmitter] HOST received audio track ({audioTrack.Length} events)");
+        playbackEngine?.ReceiveAudioTrack(audioTrack);
     }
 
     [ServerRpc(RequireOwnership = false)]

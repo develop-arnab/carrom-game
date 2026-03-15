@@ -16,6 +16,7 @@ GameObject:
   - component: {fileID: 4462265377271278704}
   - component: {fileID: 7420111282757423482}
   - component: {fileID: 8098002067023640604}
+  - component: {fileID: 7924861763708765020}
   m_Layer: 0
   m_Name: Black
   m_TagString: Black
@@ -166,8 +167,8 @@ AudioSource:
   m_Enabled: 1
   serializedVersion: 4
   OutputAudioMixerGroup: {fileID: 0}
-  m_audioClip: {fileID: 8300000, guid: e0c692d54f161de448c1f6972b5ecc40, type: 3}
-  m_Resource: {fileID: 8300000, guid: e0c692d54f161de448c1f6972b5ecc40, type: 3}
+  m_audioClip: {fileID: 8300000, guid: 02f5e3d3e07684644821b7e72b2745f3, type: 3}
+  m_Resource: {fileID: 8300000, guid: 02f5e3d3e07684644821b7e72b2745f3, type: 3}
   m_PlayOnAwake: 0
   m_Volume: 0.205
   m_Pitch: 1
@@ -303,3 +304,23 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ShowTopMostFoldoutHeaderGroup: 1
+--- !u!114 &7924861763708765020
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 6988323450565643776}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b68b1792359765347a8571b901bccb0f, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  slidingClip: {fileID: 8300000, guid: 978e7c02c7a132c459a4343e9d8fef53, type: 3}
+  minSpeed: 0.3
+  maxSpeed: 20
+  maxVolume: 1
+  volumeLerpSpeed: 10
+  minPitch: 0.8
+  maxPitch: 1.6
+  pitchLerpSpeed: 6

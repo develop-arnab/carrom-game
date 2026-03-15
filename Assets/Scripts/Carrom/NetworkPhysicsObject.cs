@@ -2,71 +2,95 @@ using UnityEngine;
 using Unity.Netcode;
 
 /// <summary>
-/// Authority-based physics control for async telemetry replay architecture.
-/// Active player (Host OR Client) runs full local physics simulation with 0ms input lag.
-/// Spectating player (Host OR Client) disables physics and uses telemetry playback.
+/// Authority-based physics control for the async telemetry replay architecture.
+///
+/// Also acts as the single source of truth for piece speed, abstracting over
+/// the dual-reality physics system:
+///   Authority  → CurrentSpeed = rb.linearVelocity.magnitude  (live Box2D data)
+///   Spectator  → CurrentSpeed = position delta / fixedDeltaTime (kinematic MovePosition)
+///
+/// ContinuousSlidingSound reads CurrentSpeed so audio works identically on both machines.
 /// </summary>
 public class NetworkPhysicsObject : NetworkBehaviour
 {
     private Rigidbody2D rb;
-    private bool hasAuthority;
-    
+    private bool        hasAuthority;
+
+    // Speed abstraction — valid for both Dynamic (authority) and Kinematic (spectator) bodies
+    public float CurrentSpeed { get; private set; }
+    private Vector2 previousPosition;
+
+    // -------------------------------------------------------------------------
+    // LIFECYCLE
+    // -------------------------------------------------------------------------
+
     private void Awake()
     {
-        rb = GetComponent<Rigidbody2D>();
+        rb               = GetComponent<Rigidbody2D>();
+        previousPosition = transform.position;
     }
-    
+
     public override void OnNetworkSpawn()
     {
         base.OnNetworkSpawn();
-        
-        // Authority-based physics control (NOT server-authoritative)
-        // The player who owns this NetworkObject runs local physics
-        // Active_Player: Rigidbody2D.simulated = true (full local physics, 0ms lag)
-        // Spectating_Player: Rigidbody2D.simulated = false (no physics, telemetry playback)
         hasAuthority = IsOwner;
+        previousPosition = transform.position;
         SetPhysicsSimulation(hasAuthority);
-        
-        Debug.Log($"[Network] {gameObject.name} physics simulation: {rb.simulated} (Authority: {hasAuthority}, IsOwner: {IsOwner})");
+        Debug.Log($"[NetworkPhysicsObject] {gameObject.name} — Authority:{hasAuthority} Simulated:{rb.simulated}");
     }
-    
+
+    // -------------------------------------------------------------------------
+    // UNIFIED SPEED CALCULATION
+    // -------------------------------------------------------------------------
+
+    private void FixedUpdate()
+    {
+        // Always calculate kinematic delta — covers UI slider teleportation on authority
+        // and MovePosition replay on spectator
+        float kinematicSpeed = Vector2.Distance(transform.position, previousPosition) / Time.fixedDeltaTime;
+
+        if (hasAuthority)
+        {
+            // Take the max: Box2D velocity wins during a real shot,
+            // kinematic delta wins when the slider moves the piece directly
+            CurrentSpeed = Mathf.Max(rb.linearVelocity.magnitude, kinematicSpeed);
+        }
+        else
+        {
+            // Spectator: body is Kinematic, linearVelocity is always zero
+            CurrentSpeed = kinematicSpeed;
+        }
+
+        previousPosition = transform.position;
+    }
+
+    // -------------------------------------------------------------------------
+    // AUTHORITY CONTROL
+    // -------------------------------------------------------------------------
+
     /// <summary>
     /// Switch between active (simulated) and spectating (not simulated) modes.
     /// Called during authority transfer between turns.
-    /// CRITICAL: This enables 0ms input lag for whichever player has the turn.
     /// </summary>
-    /// <param name="isActive">True if this player is the Active_Player, false if Spectating_Player</param>
     public void SetAuthority(bool isActive)
     {
-        hasAuthority = isActive;
+        hasAuthority     = isActive;
+        previousPosition = transform.position; // reset delta so speed doesn't spike on switch
         SetPhysicsSimulation(isActive);
-        Debug.Log($"[Network] {gameObject.name} authority changed: {isActive}, physics simulation: {rb.simulated}");
+        Debug.Log($"[NetworkPhysicsObject] {gameObject.name} authority → {isActive}");
     }
-    
-    /// <summary>
-    /// Control Rigidbody2D.simulated property to enable/disable physics calculations.
-    /// When simulated = true: Full Box2D physics runs locally (Active Player)
-    /// When simulated = false: Zero physics overhead, PlaybackEngine controls transforms (Spectating Player)
-    /// </summary>
-    /// <param name="simulate">True to enable physics, false to disable</param>
+
     public void SetPhysicsSimulation(bool simulate)
     {
-        if (rb != null)
-        {
-            rb.simulated = simulate;
-        }
+        if (rb != null) rb.simulated = simulate;
     }
-    
+
     /// <summary>
     /// Update visual Transform without affecting Rigidbody2D physics state.
-    /// Used by PlaybackEngine on Spectating_Player to render interpolated positions.
+    /// Used by PlaybackEngine on the spectator to render interpolated positions.
     /// </summary>
-    /// <param name="position">Target position</param>
-    /// <param name="rotation">Target rotation (Z-axis degrees)</param>
     public void SetVisualTransform(Vector2 position, float rotation)
     {
-        // Directly modify Transform, not Rigidbody2D
-        // This decouples visual rendering from physics state
         transform.position = new Vector3(position.x, position.y, transform.position.z);
         transform.rotation = Quaternion.Euler(0, 0, rotation);
     }

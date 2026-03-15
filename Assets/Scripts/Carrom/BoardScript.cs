@@ -1,190 +1,192 @@
 using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 using TMPro;
 using Unity.Netcode;
 
+/// <summary>
+/// Handles pocket triggers using the Graveyard pattern.
+///
+/// Key changes from original:
+/// - Owner check replaces IsServer guard so the active Client processes their own triggers.
+/// - Despawn/Destroy replaced with off-screen teleport so PlaybackEngine replay is never broken.
+/// - Score writes go through ServerRpcs so the Client can update NetworkVariables safely.
+/// </summary>
 public class BoardScript : NetworkBehaviour
 {
-    public static int scoreEnemy = 0;
+    public static int scoreEnemy  = 0;
     public static int scorePlayer = 0;
 
-    TextMeshProUGUI popUpText;
+    // Off-screen graveyard position — far enough to never interfere with physics
+    private static readonly Vector3 GraveyardPosition = new Vector3(1000f, 1000f, 0f);
+
+    private TextMeshProUGUI popUpText;
 
     private void Start()
     {
-        // Find the UpdatesText object and get the TextMeshProUGUI component
         popUpText = GameObject.Find("UpdatesText").GetComponent<TextMeshProUGUI>();
     }
 
-    IEnumerator textPopUp(string text)
+    // -------------------------------------------------------------------------
+    // TRIGGER
+    // -------------------------------------------------------------------------
+
+    private void OnTriggerEnter2D(Collider2D other)
     {
-        // Set the text and activate the UpdatesText object
-        popUpText.text = text;
-        popUpText.gameObject.SetActive(true);
-        yield return new WaitForSeconds(3f);
-        // Deactivate the UpdatesText object after 3 seconds
-        popUpText.gameObject.SetActive(false);
+        // In multiplayer, only the piece owner (active player) processes pocketing.
+        // The spectator ignores it — their replay will show the piece sliding in.
+        if (IsSpawned)
+        {
+            NetworkObject netObj = other.gameObject.GetComponent<NetworkObject>();
+            if (netObj != null && !netObj.IsOwner) return;
+        }
+
+        GetComponent<AudioSource>().Play();
+
+        switch (other.gameObject.tag)
+        {
+            case "Striker":
+                HandleStriker(other);
+                break;
+            case "Black":
+                HandleBlack(other);
+                break;
+            case "White":
+                HandleWhite(other);
+                break;
+            case "Queen":
+                HandleQueen(other);
+                break;
+        }
     }
+
+    // -------------------------------------------------------------------------
+    // POCKET HANDLERS
+    // -------------------------------------------------------------------------
+
+    private void HandleStriker(Collider2D other)
+    {
+        other.gameObject.GetComponent<Rigidbody2D>().linearVelocity = Vector2.zero;
+
+        bool isPlayerTurn = StrikerController.playerTurn;
+        string msg = "Striker Lost! -1 to " + (isPlayerTurn ? "Player" : "Enemy");
+
+        if (IsSpawned)
+        {
+            if (isPlayerTurn) AddPlayerScoreServerRpc(-1);
+            else              AddEnemyScoreServerRpc(-1);
+            ShowPopupTextClientRpc(msg);
+        }
+        else
+        {
+            if (isPlayerTurn) scorePlayer--;
+            else              scoreEnemy--;
+            StartCoroutine(textPopUp(msg));
+        }
+    }
+
+    private void HandleBlack(Collider2D other)
+    {
+        SendToGraveyard(other);
+
+        string msg = "Black Coin Entered! +1 to Enemy";
+        if (IsSpawned)
+        {
+            AddEnemyScoreServerRpc(1);
+            ShowPopupTextClientRpc(msg);
+        }
+        else
+        {
+            scoreEnemy++;
+            StartCoroutine(textPopUp(msg));
+        }
+    }
+
+    private void HandleWhite(Collider2D other)
+    {
+        SendToGraveyard(other);
+
+        string msg = "White Coin Entered! +1 to Player";
+        if (IsSpawned)
+        {
+            AddPlayerScoreServerRpc(1);
+            ShowPopupTextClientRpc(msg);
+        }
+        else
+        {
+            scorePlayer++;
+            StartCoroutine(textPopUp(msg));
+        }
+    }
+
+    private void HandleQueen(Collider2D other)
+    {
+        SendToGraveyard(other);
+
+        bool isPlayerTurn = StrikerController.playerTurn;
+        string msg = "Queen Entered! +2 to " + (isPlayerTurn ? "Player" : "Enemy");
+
+        if (IsSpawned)
+        {
+            if (isPlayerTurn) AddPlayerScoreServerRpc(2);
+            else              AddEnemyScoreServerRpc(2);
+            ShowPopupTextClientRpc(msg);
+        }
+        else
+        {
+            if (isPlayerTurn) scorePlayer += 2;
+            else              scoreEnemy  += 2;
+            StartCoroutine(textPopUp(msg));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // GRAVEYARD — teleport off-screen instead of despawning
+    // -------------------------------------------------------------------------
+
+    private static void SendToGraveyard(Collider2D other)
+    {
+        Rigidbody2D rb = other.gameObject.GetComponent<Rigidbody2D>();
+        if (rb != null)
+        {
+            rb.linearVelocity  = Vector2.zero;
+            rb.angularVelocity = 0f;
+        }
+        other.transform.position = GraveyardPosition;
+    }
+
+    // -------------------------------------------------------------------------
+    // SERVER RPCs — allow Client to write to NetworkVariables
+    // -------------------------------------------------------------------------
+
+    [ServerRpc(RequireOwnership = false)]
+    private void AddPlayerScoreServerRpc(int amount)
+    {
+        CarromGameManager gm = FindObjectOfType<CarromGameManager>();
+        if (gm != null) gm.networkScorePlayer.Value += amount;
+    }
+
+    [ServerRpc(RequireOwnership = false)]
+    private void AddEnemyScoreServerRpc(int amount)
+    {
+        CarromGameManager gm = FindObjectOfType<CarromGameManager>();
+        if (gm != null) gm.networkScoreEnemy.Value += amount;
+    }
+
+    // -------------------------------------------------------------------------
+    // UI
+    // -------------------------------------------------------------------------
+
     [ClientRpc]
     private void ShowPopupTextClientRpc(string message)
     {
         StartCoroutine(textPopUp(message));
     }
 
-
-    private void OnTriggerEnter2D(Collider2D other)
+    private IEnumerator textPopUp(string text)
     {
-        // Only Host processes collisions in multiplayer
-        if (IsSpawned && !IsServer)
-        {
-            return;
-        }
-        
-        // Play audio when a coin/striker enters the pocket
-        GetComponent<AudioSource>().Play();
-        
-        CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-
-        switch (other.gameObject.tag)
-        {
-            case "Striker":
-                if (StrikerController.playerTurn == true)
-                {
-                    scorePlayer--; // Decrement the player's score by 1
-                    if (IsSpawned && gm != null)
-                    {
-                        gm.networkScorePlayer.Value--;
-                    }
-                }
-                else
-                {
-                    scoreEnemy--; // Decrement the enemy's score by 1
-                    if (IsSpawned && gm != null)
-                    {
-                        gm.networkScoreEnemy.Value--;
-                    }
-                }
-
-                string strikerMessage = "Striker Lost! -1 to " + (StrikerController.playerTurn ? "Player" : "Enemy");
-                if (IsSpawned)
-                {
-                    ShowPopupTextClientRpc(strikerMessage);
-                }
-                else
-                {
-                    StartCoroutine(textPopUp(strikerMessage));
-                }
-                
-                other.gameObject.GetComponent<Rigidbody2D>().linearVelocity = Vector2.zero; // Set the velocity of the Striker to zero
-                break;
-
-            case "Black":
-                scoreEnemy++; // Increment the enemy's score by 1
-                if (IsSpawned && gm != null)
-                {
-                    gm.networkScoreEnemy.Value++;
-                }
-
-                string blackMessage = "Black Coin Entered! +1 to Enemy";
-                if (IsSpawned)
-                {
-                    ShowPopupTextClientRpc(blackMessage);
-                }
-                else
-                {
-                    StartCoroutine(textPopUp(blackMessage));
-                }
-                
-                // Properly destroy NetworkObject
-                if (IsSpawned)
-                {
-                    NetworkObject netObj = other.gameObject.GetComponent<NetworkObject>();
-                    if (netObj != null)
-                    {
-                        netObj.Despawn(true);
-                    }
-                }
-                else
-                {
-                    Destroy(other.gameObject);
-                }
-                break;
-
-            case "White":
-                scorePlayer++; // Increment the player's score by 1
-                if (IsSpawned && gm != null)
-                {
-                    gm.networkScorePlayer.Value++;
-                }
-
-                string whiteMessage = "White Coin Entered! +1 to Player";
-                if (IsSpawned)
-                {
-                    ShowPopupTextClientRpc(whiteMessage);
-                }
-                else
-                {
-                    StartCoroutine(textPopUp(whiteMessage));
-                }
-                
-                // Properly destroy NetworkObject
-                if (IsSpawned)
-                {
-                    NetworkObject netObj = other.gameObject.GetComponent<NetworkObject>();
-                    if (netObj != null)
-                    {
-                        netObj.Despawn(true);
-                    }
-                }
-                else
-                {
-                    Destroy(other.gameObject);
-                }
-                break;
-
-            case "Queen":
-                if (StrikerController.playerTurn == true)
-                {
-                    scorePlayer += 2; // Increment the player's score by 2
-                    if (IsSpawned && gm != null)
-                    {
-                        gm.networkScorePlayer.Value += 2;
-                    }
-                }
-                else
-                {
-                    scoreEnemy += 2; // Increment the enemy's score by 2
-                    if (IsSpawned && gm != null)
-                    {
-                        gm.networkScoreEnemy.Value += 2;
-                    }
-                }
-
-                string queenMessage = "Queen Entered! +2 to " + (StrikerController.playerTurn ? "Player" : "Enemy");
-                if (IsSpawned)
-                {
-                    ShowPopupTextClientRpc(queenMessage);
-                }
-                else
-                {
-                    StartCoroutine(textPopUp(queenMessage));
-                }
-                
-                // Properly destroy NetworkObject
-                if (IsSpawned)
-                {
-                    NetworkObject netObj = other.gameObject.GetComponent<NetworkObject>();
-                    if (netObj != null)
-                    {
-                        netObj.Despawn(true);
-                    }
-                }
-                else
-                {
-                    Destroy(other.gameObject);
-                }
-                break;
-        }
+        popUpText.text = text;
+        popUpText.gameObject.SetActive(true);
+        yield return new WaitForSeconds(3f);
+        popUpText.gameObject.SetActive(false);
     }
 }

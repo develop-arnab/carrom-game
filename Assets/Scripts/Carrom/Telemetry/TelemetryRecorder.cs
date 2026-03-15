@@ -3,31 +3,50 @@ using UnityEngine;
 
 /// <summary>
 /// Records ALL 20 pieces every FixedUpdate tick for the duration of the shot.
-/// No filtering. No compression. Mathematically perfect capture.
-/// Each frame = 260 bytes. A 5-second shot at 50Hz = 250 frames = 65KB total.
-/// Chunked transmission handles the 64KB RPC limit.
+/// Also maintains a decoupled audio track: collision events broadcast by
+/// CollisionSoundManager and StrikerController are logged with their frame index
+/// so the spectator's PlaybackEngine can play them at the exact right moment.
 /// </summary>
 public class TelemetryRecorder : MonoBehaviour
 {
     [Header("References")]
     [SerializeField] private PieceRegistry pieceRegistry;
 
-    private List<PhysicsFrame> fullShotRecording = new List<PhysicsFrame>(512);
+    // Visual track
+    private List<PhysicsFrame>      fullShotRecording = new List<PhysicsFrame>(512);
+
+    // Audio track — decoupled from PieceState, logged on collision events
+    private List<ReplayAudioEvent>  audioTrack        = new List<ReplayAudioEvent>(64);
+
     private bool isRecording;
 
-    public bool IsRecording  => isRecording;
-    public int  FrameCount   => fullShotRecording.Count;
+    public bool IsRecording => isRecording;
+    public int  FrameCount  => fullShotRecording.Count;
 
     public void SetPieceRegistry(PieceRegistry r) => pieceRegistry = r;
 
-    private void FixedUpdate()
+    // -------------------------------------------------------------------------
+    // SUBSCRIBE / UNSUBSCRIBE
+    // -------------------------------------------------------------------------
+
+    private void OnEnable()
     {
-        if (isRecording) CaptureFrame();
+        CollisionSoundManager.OnCollisionSoundPlayed += OnCollisionSound;
     }
+
+    private void OnDisable()
+    {
+        CollisionSoundManager.OnCollisionSoundPlayed -= OnCollisionSound;
+    }
+
+    // -------------------------------------------------------------------------
+    // RECORDING CONTROL
+    // -------------------------------------------------------------------------
 
     public void StartRecording()
     {
         fullShotRecording.Clear();
+        audioTrack.Clear();
         isRecording = true;
         Debug.Log("[TelemetryRecorder] Recording started");
     }
@@ -35,12 +54,18 @@ public class TelemetryRecorder : MonoBehaviour
     public void StopRecording()
     {
         isRecording = false;
-        Debug.Log($"[TelemetryRecorder] Recording stopped — {fullShotRecording.Count} frames captured");
+        Debug.Log($"[TelemetryRecorder] Recording stopped — {fullShotRecording.Count} visual frames, {audioTrack.Count} audio events");
     }
 
-    /// <summary>
-    /// Unconditionally records all 20 pieces every tick.
-    /// </summary>
+    // -------------------------------------------------------------------------
+    // VISUAL CAPTURE — LOCKED, runs every FixedUpdate tick
+    // -------------------------------------------------------------------------
+
+    private void FixedUpdate()
+    {
+        if (isRecording) CaptureFrame();
+    }
+
     private void CaptureFrame()
     {
         if (pieceRegistry == null) return;
@@ -65,6 +90,28 @@ public class TelemetryRecorder : MonoBehaviour
         fullShotRecording.Add(frame);
     }
 
-    /// <summary>Returns the complete recording as an array for chunked transmission.</summary>
-    public PhysicsFrame[] GetFullRecording() => fullShotRecording.ToArray();
+    // -------------------------------------------------------------------------
+    // AUDIO CAPTURE — fires on collision broadcast
+    // -------------------------------------------------------------------------
+
+    private void OnCollisionSound(Vector2 position, float volume)
+    {
+        if (!isRecording) return;
+
+        audioTrack.Add(new ReplayAudioEvent
+        {
+            frameIndex = fullShotRecording.Count, // current frame at time of impact
+            position   = position,
+            volume     = volume
+        });
+
+        Debug.Log($"[TelemetryRecorder] Audio event logged — frame {fullShotRecording.Count}, vol {volume:F2}");
+    }
+
+    // -------------------------------------------------------------------------
+    // RETRIEVAL
+    // -------------------------------------------------------------------------
+
+    public PhysicsFrame[]     GetFullRecording() => fullShotRecording.ToArray();
+    public ReplayAudioEvent[] GetAudioTrack()    => audioTrack.ToArray();
 }

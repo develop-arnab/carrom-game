@@ -17,6 +17,7 @@ namespace Carrom.Telemetry
         [Header("References")]
         [SerializeField] private PieceRegistry    pieceRegistry;
         [SerializeField] private BatchTransmitter batchTransmitter;
+        [SerializeField] private AudioClip        collisionClip;
 
         // Download assembly
         private PhysicsFrame[]  downloadedReplay;
@@ -26,9 +27,18 @@ namespace Carrom.Telemetry
         private EndStatePayload pendingEndState;
         private bool            hasEndState;
 
+        // Audio track
+        private ReplayAudioEvent[] audioTrack;
+        private int                audioTrackIndex;
+        private bool               hasAudioTrack;
+
         // Playback state
         private int  currentIndex;
         private bool isPlaying;
+
+        // Graveyard detection — pocket sound for spectator
+        private const float GraveyardThreshold = 900f;
+        private AudioSource pocketAudioSource;
 
         public bool IsPlaying => isPlaying;
 
@@ -52,6 +62,9 @@ namespace Carrom.Telemetry
                 hasEndState      = false;
                 isPlaying        = false;
                 currentIndex     = 0;
+                audioTrack       = null;
+                audioTrackIndex  = 0;
+                hasAudioTrack    = false;
                 chunkList.Clear();
             }
 
@@ -68,6 +81,14 @@ namespace Carrom.Telemetry
             hasEndState     = true;
             Debug.Log("[PlaybackEngine] End state received");
             TryStartPlayback();
+        }
+
+        public void ReceiveAudioTrack(ReplayAudioEvent[] track)
+        {
+            audioTrack      = track;
+            audioTrackIndex = 0;
+            hasAudioTrack   = true;
+            Debug.Log($"[PlaybackEngine] Audio track received — {track.Length} events");
         }
 
         private void TryStartPlayback()
@@ -119,12 +140,39 @@ namespace Carrom.Telemetry
                 Rigidbody2D rb = piece.GetComponent<Rigidbody2D>();
                 if (rb != null)
                 {
+                    // Graveyard detection: incoming position is off-screen but piece is still on board
+                    // → this is the exact frame the active player pocketed this coin
+                    if (state.xPosition >= GraveyardThreshold && piece.transform.position.x < GraveyardThreshold)
+                    {
+                        if (pocketAudioSource == null)
+                        {
+                            BoardScript board = FindObjectOfType<BoardScript>();
+                            if (board != null) pocketAudioSource = board.GetComponent<AudioSource>();
+                        }
+                        pocketAudioSource?.Play();
+                    }
+
                     rb.MovePosition(new Vector2(state.xPosition, state.yPosition));
                     rb.MoveRotation(state.zRotation);
                 }
             }
 
             currentIndex++;
+
+            // Audio track playback — fire any events whose frameIndex matches the current visual frame.
+            // Loop handles multiple sounds on the same frame (e.g. striker hits two coins simultaneously).
+            if (hasAudioTrack && audioTrack != null && collisionClip != null)
+            {
+                while (audioTrackIndex < audioTrack.Length &&
+                       audioTrack[audioTrackIndex].frameIndex <= currentIndex)
+                {
+                    ReplayAudioEvent evt = audioTrack[audioTrackIndex];
+                    AudioSource.PlayClipAtPoint(collisionClip,
+                        new Vector3(evt.position.x, evt.position.y, 0f),
+                        evt.volume);
+                    audioTrackIndex++;
+                }
+            }
         }
 
         // -------------------------------------------------------------------------

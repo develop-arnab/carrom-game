@@ -5,8 +5,8 @@ using Unity.Netcode;
 
 public class StrikerController : NetworkBehaviour
 {
-    [SerializeField] float strikerSpeed = 100f;
     [SerializeField] float maxScale = 1f;
+    [SerializeField] float maxDragDistance = 4f;
     [SerializeField] Transform strikerForceField;
     [SerializeField] Slider strikerSlider;
 
@@ -171,7 +171,8 @@ public class StrikerController : NetworkBehaviour
 
         Vector3 direction = transform.position - Camera.main.ScreenToWorldPoint(Input.mousePosition);
         direction.z = 0f;
-        float forceMagnitude = Mathf.Clamp(direction.magnitude * strikerSpeed, 0f, maxForceMagnitude);
+        float dragPercentage = Mathf.Clamp01(direction.magnitude / maxDragDistance);
+        float forceMagnitude = dragPercentage * maxForceMagnitude;
 
         if (IsSpawned)
         {
@@ -219,9 +220,7 @@ public class StrikerController : NetworkBehaviour
         direction.z = 0f;
         strikerForceField.LookAt(transform.position + direction);
 
-        float scaleValue = Mathf.Min(
-            Vector3.Distance(transform.position, transform.position + direction / 4f),
-            maxScale);
+        float scaleValue = Mathf.Clamp01(direction.magnitude / maxDragDistance) * maxScale;
         strikerForceField.localScale = new Vector3(scaleValue, scaleValue, scaleValue);
 
         // Sync: broadcast look target and scale so spectator's arrow mirrors the drag
@@ -319,7 +318,11 @@ public class StrikerController : NetworkBehaviour
             !other.gameObject.CompareTag("Queen")) return;
 
         if (audioSource == null) return;
-        audioSource.volume = Mathf.Clamp01(currentSpeed / 10f);
+        float volume = Mathf.Clamp01(currentSpeed / 10f);
+        audioSource.volume = volume;
         audioSource.Play();
+
+        // Broadcast so TelemetryRecorder can log this into the audio track
+        CollisionSoundManager.BroadcastCollisionSound(transform.position, volume);
     }
 }

@@ -223,6 +223,7 @@ GameObject:
   - component: {fileID: 8536452893684715781}
   - component: {fileID: 5873939557258673270}
   - component: {fileID: 4936949577725782509}
+  - component: {fileID: -8868349361559670139}
   m_Layer: 0
   m_Name: Striker
   m_TagString: Striker
@@ -313,7 +314,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d5a57f767e5e46a458fc5d3c628d0cbb, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  GlobalObjectIdHash: 3986013190
+  GlobalObjectIdHash: 2026019644
   InScenePlacedSourceGlobalObjectIdHash: 0
   DeferredDespawnTick: 0
   Ownership: 1
@@ -392,8 +393,8 @@ Rigidbody2D:
   m_UseFullKinematicContacts: 0
   m_UseAutoMass: 0
   m_Mass: 1.25
-  m_LinearDamping: 1.2
-  m_AngularDamping: 1
+  m_LinearDamping: 1
+  m_AngularDamping: 0.8
   m_GravityScale: 0
   m_Material: {fileID: 6200000, guid: cb6c6136b8d41944fb45765b51e4eb12, type: 2}
   m_IncludeLayers:
@@ -429,10 +430,10 @@ AudioSource:
   m_Enabled: 1
   serializedVersion: 4
   OutputAudioMixerGroup: {fileID: 0}
-  m_audioClip: {fileID: 8300000, guid: e0c692d54f161de448c1f6972b5ecc40, type: 3}
-  m_Resource: {fileID: 8300000, guid: e0c692d54f161de448c1f6972b5ecc40, type: 3}
-  m_PlayOnAwake: 1
-  m_Volume: 1
+  m_audioClip: {fileID: 8300000, guid: ce8b6c16cd863cf45913c755d4eef59e, type: 3}
+  m_Resource: {fileID: 8300000, guid: ce8b6c16cd863cf45913c755d4eef59e, type: 3}
+  m_PlayOnAwake: 0
+  m_Volume: 0.715
   m_Pitch: 1
   Loop: 0
   Mute: 0
@@ -516,3 +517,23 @@ AudioSource:
     m_PreInfinity: 2
     m_PostInfinity: 2
     m_RotationOrder: 4
+--- !u!114 &-8868349361559670139
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 8536452893684715785}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b68b1792359765347a8571b901bccb0f, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  slidingClip: {fileID: 8300000, guid: 978e7c02c7a132c459a4343e9d8fef53, type: 3}
+  minSpeed: 0.3
+  maxSpeed: 20
+  maxVolume: 1
+  volumeLerpSpeed: 10
+  minPitch: 0.8
+  maxPitch: 1.6
+  pitchLerpSpeed: 6
