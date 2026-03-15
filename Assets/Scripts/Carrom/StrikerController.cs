@@ -14,6 +14,12 @@ public class StrikerController : NetworkBehaviour
     bool isCharging;
     float maxForceMagnitude = 30f;
     Rigidbody2D rb;
+    AudioSource audioSource;
+
+    // Manual speed tracking — needed because Kinematic bodies report zero relativeVelocity
+    // on collision, so we derive speed from position delta in FixedUpdate instead.
+    Vector3 previousPosition;
+    float   currentSpeed;
 
     public static bool playerTurn;
 
@@ -23,9 +29,11 @@ public class StrikerController : NetworkBehaviour
 
     private void Start()
     {
-        playerTurn = true;
-        rb         = GetComponent<Rigidbody2D>();
+        playerTurn   = true;
+        rb           = GetComponent<Rigidbody2D>();
+        audioSource  = GetComponent<AudioSource>();
         rb.interpolation = RigidbodyInterpolation2D.Interpolate;
+        previousPosition = transform.position;
     }
 
     /// <summary>
@@ -73,8 +81,6 @@ public class StrikerController : NetworkBehaviour
         if (strikerForceField != null)
             strikerForceField.localScale = Vector3.zero;
 
-        CollisionSoundManager.shouldBeStatic = true;
-
         if (!IsSpawned)
         {
             // Single-player: always bottom
@@ -107,6 +113,13 @@ public class StrikerController : NetworkBehaviour
     // INPUT
     // -------------------------------------------------------------------------
 
+    private void FixedUpdate()
+    {
+        // Track speed manually — Kinematic bodies report zero relativeVelocity on collision
+        currentSpeed     = Vector3.Distance(transform.position, previousPosition) / Time.fixedDeltaTime;
+        previousPosition = transform.position;
+    }
+
     private void Update()
     {
         if (!IsOwner && IsSpawned) return;
@@ -135,6 +148,10 @@ public class StrikerController : NetworkBehaviour
 
         isCharging = true;
         strikerForceField.gameObject.SetActive(true);
+
+        // Sync: tell spectator to activate the force field at the striker's current position
+        if (IsSpawned)
+            SyncForceFieldServerRpc(true, transform.position, Vector3.zero);
     }
 
     private IEnumerator OnMouseUp()
@@ -146,6 +163,10 @@ public class StrikerController : NetworkBehaviour
 
         strikerForceField.gameObject.SetActive(false);
         isCharging = false;
+
+        // Sync: tell spectator to deactivate the force field before the shot fires
+        if (IsSpawned)
+            SyncForceFieldServerRpc(false, Vector3.zero, Vector3.zero);
         yield return new WaitForSeconds(0.1f);
 
         Vector3 direction = transform.position - Camera.main.ScreenToWorldPoint(Input.mousePosition);
@@ -159,12 +180,10 @@ public class StrikerController : NetworkBehaviour
             if (gm != null) gm.OnShotStart();
 
             rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
-            CollisionSoundManager.shouldBeStatic = false;
         }
         else
         {
             rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
-            CollisionSoundManager.shouldBeStatic = false;
         }
 
         yield return new WaitForSeconds(0.1f);
@@ -204,6 +223,14 @@ public class StrikerController : NetworkBehaviour
             Vector3.Distance(transform.position, transform.position + direction / 4f),
             maxScale);
         strikerForceField.localScale = new Vector3(scaleValue, scaleValue, scaleValue);
+
+        // Sync: broadcast look target and scale so spectator's arrow mirrors the drag
+        if (IsSpawned)
+        {
+            Vector3 lookTarget = transform.position + direction;
+            Vector3 scale      = new Vector3(scaleValue, scaleValue, scaleValue);
+            SyncForceFieldServerRpc(true, lookTarget, scale);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -256,5 +283,43 @@ public class StrikerController : NetworkBehaviour
         // No SetActive(false) — single striker stays alive, OnGainedOwnership resets it
     }
 
-    private void OnCollisionEnter2D(Collision2D other) { }
+    /// <summary>
+    /// Relays force field visual state from the owner to the server,
+    /// which then broadcasts it to all non-owners via ClientRpc.
+    /// active=false deactivates the GameObject; active=true applies lookTarget + scale.
+    /// </summary>
+    [ServerRpc(RequireOwnership = false)]
+    private void SyncForceFieldServerRpc(bool active, Vector3 lookTarget, Vector3 scale, ServerRpcParams rpcParams = default)
+    {
+        SyncForceFieldClientRpc(active, lookTarget, scale);
+    }
+
+    [ClientRpc]
+    private void SyncForceFieldClientRpc(bool active, Vector3 lookTarget, Vector3 scale)
+    {
+        if (IsOwner) return; // Owner already rendered this locally with 0-lag
+
+        if (!active)
+        {
+            strikerForceField.gameObject.SetActive(false);
+            return;
+        }
+
+        strikerForceField.gameObject.SetActive(true);
+        strikerForceField.LookAt(lookTarget);
+        strikerForceField.localScale = scale;
+    }
+
+    private void OnCollisionEnter2D(Collision2D other)
+    {
+        if (currentSpeed <= 0.1f) return;
+        if (!other.gameObject.CompareTag("Board") &&
+            !other.gameObject.CompareTag("White") &&
+            !other.gameObject.CompareTag("Black") &&
+            !other.gameObject.CompareTag("Queen")) return;
+
+        if (audioSource == null) return;
+        audioSource.volume = Mathf.Clamp01(currentSpeed / 10f);
+        audioSource.Play();
+    }
 }

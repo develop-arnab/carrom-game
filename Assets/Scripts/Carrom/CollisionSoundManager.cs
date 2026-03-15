@@ -1,32 +1,25 @@
-using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 
+/// <summary>
+/// Purely audio — plays a collision sound on coins when they hit something.
+/// No physics state management. Physics body types are owned exclusively
+/// by BatchTransmitter (spectator replay) and the active player's Rigidbody2D.
+/// </summary>
 public class CollisionSoundManager : MonoBehaviour
 {
-    public static bool shouldBeStatic = true;
+    private AudioSource audioSource;
 
-    void Update()
+    private void Awake()
     {
-        // Check if the object should be static or dynamic and update its Rigidbody2D body type accordingly.
-        if (shouldBeStatic)
-        {
-            GetComponent<Rigidbody2D>().bodyType = RigidbodyType2D.Static;
-        }
-        else
-        {
-            GetComponent<Rigidbody2D>().bodyType = RigidbodyType2D.Dynamic;
-        }
+        audioSource = GetComponent<AudioSource>();
     }
 
     private void OnCollisionEnter2D(Collision2D other)
     {
-        // Check if the collision is not with a "Pocket" object and the relative velocity magnitude is greater than 0.1f.
-        if (!other.gameObject.CompareTag("Pocket") && other.relativeVelocity.magnitude > 0.1f)
-        {
-            // Play the collision sound and adjust the volume based on the relative velocity magnitude.
-            GetComponent<AudioSource>().Play();
-            GetComponent<AudioSource>().volume = other.relativeVelocity.magnitude / 10;
-        }
+        if (other.gameObject.CompareTag("Pocket")) return;
+        if (other.relativeVelocity.magnitude <= 0.1f) return;
+
+        audioSource.volume = Mathf.Clamp01(other.relativeVelocity.magnitude / 10f);
+        audioSource.Play();
     }
 }

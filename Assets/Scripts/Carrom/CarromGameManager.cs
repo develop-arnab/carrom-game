@@ -84,8 +84,28 @@ public class CarromGameManager : NetworkBehaviour
     public override void OnNetworkSpawn()
     {
         base.OnNetworkSpawn();
+
+        UnityEngine.UI.Slider sliderComponent = slider != null
+            ? slider.GetComponent<UnityEngine.UI.Slider>()
+            : null;
+
         if (IsServer)
+        {
+            // Host: enforce default orientation (safe on scene reload)
+            Camera.main.transform.rotation = Quaternion.Euler(0f, 0f, 0f);
+            if (sliderComponent != null)
+                sliderComponent.direction = UnityEngine.UI.Slider.Direction.LeftToRight;
+
             StartCoroutine(SendInitialBoardStateDelayed());
+        }
+        else
+        {
+            // Client: flip camera 180° on Z so the board reads naturally from their side
+            Camera.main.transform.rotation = Quaternion.Euler(0f, 0f, 180f);
+            // Mirror the slider so dragging right still moves the striker right visually
+            if (sliderComponent != null)
+                sliderComponent.direction = UnityEngine.UI.Slider.Direction.RightToLeft;
+        }
     }
 
     private IEnumerator SendInitialBoardStateDelayed()
