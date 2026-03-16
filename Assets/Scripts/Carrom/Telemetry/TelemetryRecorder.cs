@@ -100,12 +100,10 @@ public class TelemetryRecorder : MonoBehaviour
 
         audioTrack.Add(new ReplayAudioEvent
         {
-            frameIndex = fullShotRecording.Count, // current frame at time of impact
+            frameIndex = fullShotRecording.Count,
             position   = position,
             volume     = volume
         });
-
-        Debug.Log($"[TelemetryRecorder] Audio event logged — frame {fullShotRecording.Count}, vol {volume:F2}");
     }
 
     // -------------------------------------------------------------------------

@@ -6,7 +6,7 @@ using Unity.Netcode;
 public class StrikerController : NetworkBehaviour
 {
     [SerializeField] float maxScale = 1f;
-    [SerializeField] float maxDragDistance = 4f;
+    [SerializeField] float maxDragDistance = 2f;
     [SerializeField] Transform strikerForceField;
     [SerializeField] Slider strikerSlider;
 

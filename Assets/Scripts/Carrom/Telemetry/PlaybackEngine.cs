@@ -150,6 +150,8 @@ namespace Carrom.Telemetry
                             if (board != null) pocketAudioSource = board.GetComponent<AudioSource>();
                         }
                         pocketAudioSource?.Play();
+                        SpriteRenderer sr = piece.GetComponent<SpriteRenderer>();
+                        if (sr != null) SpawnGhostCoin(sr.sprite, piece.transform.position);
                     }
 
                     rb.MovePosition(new Vector2(state.xPosition, state.yPosition));
@@ -230,6 +232,44 @@ namespace Carrom.Telemetry
             isPlaying        = false;
             currentIndex     = 0;
             downloadedReplay = null;
+        }
+
+        // -------------------------------------------------------------------------
+        // GHOST COIN — physics-less visual effect, local only, no network involvement
+        // -------------------------------------------------------------------------
+
+        private void SpawnGhostCoin(Sprite originalSprite, Vector3 spawnPosition)
+        {
+            if (originalSprite == null) return;
+            GameObject ghost    = new GameObject("GhostCoin");
+            ghost.transform.position = spawnPosition;
+            SpriteRenderer ghostSr  = ghost.AddComponent<SpriteRenderer>();
+            ghostSr.sprite           = originalSprite;
+            ghostSr.sortingOrder     = 10;
+            StartCoroutine(AnimateGhostCoin(ghost, ghostSr));
+        }
+
+        private System.Collections.IEnumerator AnimateGhostCoin(GameObject ghost, SpriteRenderer ghostSr)
+        {
+            float   duration   = 0.6f;
+            float   elapsed    = 0f;
+            Vector3 startScale = Vector3.one * 0.7f;
+            Vector3 endScale   = Vector3.one * 0.4f;
+            Color   baseColor  = ghostSr.color;
+            Color   startColor = new Color(baseColor.r, baseColor.g, baseColor.b, 0.6f);
+            Color   endColor   = new Color(baseColor.r, baseColor.g, baseColor.b, 0f);
+            ghostSr.color      = startColor;
+
+            while (elapsed < duration)
+            {
+                float t = elapsed / duration;
+                ghost.transform.localScale = Vector3.Lerp(startScale, endScale, t);
+                ghostSr.color              = Color.Lerp(startColor, endColor, t);
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+
+            Destroy(ghost);
         }
     }
 }

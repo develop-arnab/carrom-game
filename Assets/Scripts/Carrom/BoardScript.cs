@@ -145,6 +145,10 @@ public class BoardScript : NetworkBehaviour
 
     private static void SendToGraveyard(Collider2D other)
     {
+        // Grab sprite before teleporting so the ghost spawns at the pocket position
+        SpriteRenderer sr = other.gameObject.GetComponent<SpriteRenderer>();
+        if (sr != null) Instance.SpawnGhostCoin(sr.sprite, other.transform.position);
+
         Rigidbody2D rb = other.gameObject.GetComponent<Rigidbody2D>();
         if (rb != null)
         {
@@ -152,6 +156,48 @@ public class BoardScript : NetworkBehaviour
             rb.angularVelocity = 0f;
         }
         other.transform.position = GraveyardPosition;
+    }
+
+    // -------------------------------------------------------------------------
+    // GHOST COIN — physics-less visual effect, no network involvement
+    // -------------------------------------------------------------------------
+
+    // Static instance reference so the static SendToGraveyard can reach the coroutine runner
+    private static BoardScript Instance;
+    private void Awake() { Instance = this; }
+
+    private void SpawnGhostCoin(Sprite originalSprite, Vector3 spawnPosition)
+    {
+        if (originalSprite == null) return;
+        GameObject ghost = new GameObject("GhostCoin");
+        ghost.transform.position = spawnPosition;
+        SpriteRenderer ghostSr = ghost.AddComponent<SpriteRenderer>();
+        ghostSr.sprite          = originalSprite;
+        ghostSr.sortingOrder    = 10; // render on top
+        StartCoroutine(AnimateGhostCoin(ghost, ghostSr));
+    }
+
+    private IEnumerator AnimateGhostCoin(GameObject ghost, SpriteRenderer ghostSr)
+    {
+        float   duration   = 0.6f;
+        float   elapsed    = 0f;
+        Vector3 startScale = Vector3.one * 0.7f;
+        Vector3 endScale   = Vector3.one * 0.4f;
+        Color   baseColor  = ghostSr.color;
+        Color   startColor = new Color(baseColor.r, baseColor.g, baseColor.b, 0.6f);
+        Color   endColor   = new Color(baseColor.r, baseColor.g, baseColor.b, 0f);
+        ghostSr.color      = startColor;
+
+        while (elapsed < duration)
+        {
+            float t = elapsed / duration;
+            ghost.transform.localScale = Vector3.Lerp(startScale, endScale, t);
+            ghostSr.color              = Color.Lerp(startColor, endColor, t);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        Destroy(ghost);
     }
 
     // -------------------------------------------------------------------------
