@@ -12,6 +12,7 @@ public class AuthenticationMenu : Panel
     [SerializeField] private Button signinButton = null;
     [SerializeField] private Button signupButton = null;
     [SerializeField] private Button anonymousButton = null;
+    [SerializeField] private TextMeshProUGUI errorText = null;
 
     public override void Initialize()
     {
@@ -21,7 +22,7 @@ public class AuthenticationMenu : Panel
         }
         anonymousButton.onClick.AddListener(AnonymousSignIn);
         signinButton.onClick.AddListener(SignIn);
-        signupButton.onClick.AddListener(SignUp);
+        signupButton.onClick.AddListener(SignIn); // both buttons use the same unified flow
         base.Initialize();
     }
 
@@ -29,16 +30,37 @@ public class AuthenticationMenu : Panel
     {
         usernameInput.text = "";
         passwordInput.text = "";
+        ClearError();
         base.Open();
+    }
+
+    public void ShowError(string message)
+    {
+        if (errorText != null)
+        {
+            errorText.text = message;
+            errorText.gameObject.SetActive(true);
+        }
+    }
+
+    public void ClearError()
+    {
+        if (errorText != null)
+        {
+            errorText.text = "";
+            errorText.gameObject.SetActive(false);
+        }
     }
 
     private void AnonymousSignIn()
     {
+        ClearError();
         MainMenuManager.Singleton.SignInAnonymouslyAsync();
     }
 
     private void SignIn()
     {
+        ClearError();
         string user = usernameInput.text.Trim();
         string pass = passwordInput.text.Trim();
         if (string.IsNullOrEmpty(user) == false && string.IsNullOrEmpty(pass) == false)
@@ -49,6 +71,7 @@ public class AuthenticationMenu : Panel
 
     private void SignUp()
     {
+        ClearError();
         string user = usernameInput.text.Trim();
         string pass = passwordInput.text.Trim();
         if (string.IsNullOrEmpty(user) == false && string.IsNullOrEmpty(pass) == false)
@@ -59,8 +82,7 @@ public class AuthenticationMenu : Panel
             }
             else
             {
-                ErrorMenu panel = (ErrorMenu)PanelManager.GetSingleton("error");
-                panel.Open(ErrorMenu.Action.None, "Password does not match requirements. Insert at least 1 uppercase, 1 lowercase, 1 digit and 1 symbol. With minimum 8 and a maximum of 30 characters.", "OK");
+                ShowError("Password needs 8-30 chars with uppercase, lowercase, digit and symbol.");
             }
         }
     }

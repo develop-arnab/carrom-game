@@ -18,6 +18,9 @@ public class MainMenu : Panel
     [SerializeField] private Button renameButton = null;
     [SerializeField] private Button customizationButton = null;
     [SerializeField] private Button playBetsButton = null;
+    [SerializeField] private Button playCarromButton = null;
+    [SerializeField] private TMP_InputField joinCodeInput = null;
+    [SerializeField] private Button joinButton = null;
 
     private bool isFriendsServiceInitialized = false;
     
@@ -33,6 +36,8 @@ public class MainMenu : Panel
         renameButton.onClick.AddListener(RenamePlayer);
         customizationButton.onClick.AddListener(Customization);
         playBetsButton.onClick.AddListener(PlayBets);
+        if (playCarromButton != null) playCarromButton.onClick.AddListener(PlayCarrom);
+        if (joinButton != null) joinButton.onClick.AddListener(JoinByCode);
         base.Initialize();
     }
     
@@ -55,6 +60,33 @@ public class MainMenu : Panel
     private void PlayBets()
     {
         SceneManager.LoadScene(4);
+    }
+
+    private void PlayCarrom()
+    {
+        if (playCarromButton != null) playCarromButton.interactable = false;
+        LobbyManager.Instance.QuickJoinOrCreatePublicLobby();
+    }
+
+    private void JoinByCode()
+    {
+        if (joinCodeInput == null || joinButton == null) return;
+        string code = joinCodeInput.text.Trim();
+        if (string.IsNullOrEmpty(code)) return;
+
+        joinButton.interactable = false;
+        joinCodeInput.interactable = false;
+        try
+        {
+            LobbyManager.Instance.JoinLobbyByCode(code);
+        }
+        catch
+        {
+            joinButton.interactable = true;
+            joinCodeInput.interactable = true;
+            ErrorMenu panel = (ErrorMenu)PanelManager.GetSingleton("error");
+            panel.Open(ErrorMenu.Action.None, "Failed to join lobby.", "OK");
+        }
     }
 
     private async void InitializeFriendsServiceAsync()
@@ -86,9 +118,11 @@ public class MainMenu : Panel
         }
     }
     
-    private void UpdatePlayerNameUI()
+    public void UpdatePlayerNameUI()
     {
-        nameText.text = AuthenticationService.Instance.PlayerName;
+        string fullName = AuthenticationService.Instance.PlayerName ?? "";
+        // Show full name including #NNNN so players can share it for friend requests
+        nameText.text = fullName;
     }
     
     private void Leaderboards()

@@ -12,9 +12,13 @@ public class StrikerController : NetworkBehaviour
 
     bool isMoving;
     bool isCharging;
+    bool isDragging;          // true while finger/mouse is locked onto the striker
     float maxForceMagnitude = 30f;
     Rigidbody2D rb;
     AudioSource audioSource;
+
+    // Cached world-space input position — shared between grab, drag, and release
+    Vector3 inputWorldPos;
 
     // Manual speed tracking — needed because Kinematic bodies report zero relativeVelocity
     // on collision, so we derive speed from position delta in FixedUpdate instead.
@@ -71,6 +75,7 @@ public class StrikerController : NetworkBehaviour
         // Wipe physics residuals
         isMoving   = false;
         isCharging = false;
+        isDragging = false;
         if (rb != null)
         {
             rb.linearVelocity  = Vector2.zero;
@@ -120,56 +125,105 @@ public class StrikerController : NetworkBehaviour
         previousPosition = transform.position;
     }
 
+    // -------------------------------------------------------------------------
+    // INPUT — unified raycast (Desktop + Mobile)
+    // -------------------------------------------------------------------------
+
     private void Update()
     {
         if (!IsOwner && IsSpawned) return;
 
-        if (rb.linearVelocity.magnitude < 0.1f && !isMoving)
+        // --- Determine raw screen position and phase from mouse OR touch ---
+        bool pressed  = false;
+        bool held     = false;
+        bool released = false;
+        Vector3 screenPos = Vector3.zero;
+
+        if (Input.touchCount > 0)
+        {
+            Touch touch = Input.GetTouch(0);
+            screenPos = touch.position;
+            pressed   = touch.phase == TouchPhase.Began;
+            held      = touch.phase == TouchPhase.Moved || touch.phase == TouchPhase.Stationary;
+            released  = touch.phase == TouchPhase.Ended || touch.phase == TouchPhase.Canceled;
+        }
+        else
+        {
+            screenPos = Input.mousePosition;
+            pressed   = Input.GetMouseButtonDown(0);
+            held      = Input.GetMouseButton(0);
+            released  = Input.GetMouseButtonUp(0);
+        }
+
+        Camera cam = Camera.main;
+        Vector3 worldPos = cam.ScreenToWorldPoint(screenPos);
+        worldPos.z = 0f;
+
+        // --- GRAB ---
+        if (pressed && !isDragging && !isMoving)
+        {
+            if (rb.linearVelocity.magnitude > 0.1f) return;
+
+            RaycastHit2D hit = Physics2D.Raycast(worldPos, Vector2.zero);
+            if (hit.collider == null || hit.collider.gameObject != gameObject) return;
+
+            float correctY = (!IsSpawned || IsServer) ? -4.57f : 3.45f;
+            if (Mathf.Abs(transform.position.y - correctY) > 0.01f)
+                transform.position = new Vector3(transform.position.x, correctY, 0);
+
+            isDragging = true;
+            isCharging = true;
+            strikerForceField.gameObject.SetActive(true);
+
+            if (IsSpawned)
+                SyncForceFieldServerRpc(true, transform.position, Vector3.zero);
+        }
+
+        // --- DRAG ---
+        if (held && isDragging && isCharging)
+        {
+            Vector3 direction = transform.position - worldPos;
+            direction.z = 0f;
+            strikerForceField.LookAt(transform.position + direction);
+
+            float scaleValue = Mathf.Clamp01(direction.magnitude / maxDragDistance) * maxScale;
+            strikerForceField.localScale = new Vector3(scaleValue, scaleValue, scaleValue);
+
+            if (IsSpawned)
+                SyncForceFieldServerRpc(true, transform.position + direction, new Vector3(scaleValue, scaleValue, scaleValue));
+        }
+
+        // --- RELEASE ---
+        if (released && isDragging)
+        {
+            isDragging = false;
+            if (!isMoving)
+            {
+                isMoving = true;
+                StartCoroutine(FireShot(worldPos));
+            }
+        }
+
+        // --- AUTO-FIRE when velocity settles (single-player safety net) ---
+        if (!IsSpawned && rb.linearVelocity.magnitude < 0.1f && !isMoving)
         {
             isMoving = true;
-            StartCoroutine(OnMouseUp());
+            StartCoroutine(FireShot(worldPos));
         }
     }
 
-    private void OnMouseDown()
+    private IEnumerator FireShot(Vector3 releaseWorldPos)
     {
-        if (!IsOwner && IsSpawned) return;
-
-        if (rb.linearVelocity.magnitude > 0.1f)
-        {
-            isCharging = false;
-            return;
-        }
-
-        // Snap to correct Y if drifted
-        float correctY = (!IsSpawned || IsServer) ? -4.57f : 3.45f;
-        if (Mathf.Abs(transform.position.y - correctY) > 0.01f)
-            transform.position = new Vector3(transform.position.x, correctY, 0);
-
-        isCharging = true;
-        strikerForceField.gameObject.SetActive(true);
-
-        // Sync: tell spectator to activate the force field at the striker's current position
-        if (IsSpawned)
-            SyncForceFieldServerRpc(true, transform.position, Vector3.zero);
-    }
-
-    private IEnumerator OnMouseUp()
-    {
-        isMoving = true;
-        yield return new WaitForSeconds(0.1f);
-
-        if (!isCharging) yield break;
+        if (!isCharging) { isMoving = false; yield break; }
 
         strikerForceField.gameObject.SetActive(false);
         isCharging = false;
 
-        // Sync: tell spectator to deactivate the force field before the shot fires
         if (IsSpawned)
             SyncForceFieldServerRpc(false, Vector3.zero, Vector3.zero);
         yield return new WaitForSeconds(0.1f);
 
-        Vector3 direction = transform.position - Camera.main.ScreenToWorldPoint(Input.mousePosition);
+        Vector3 direction = transform.position - releaseWorldPos;
         direction.z = 0f;
         float dragPercentage = Mathf.Clamp01(direction.magnitude / maxDragDistance);
         float forceMagnitude = dragPercentage * maxForceMagnitude;
@@ -177,9 +231,7 @@ public class StrikerController : NetworkBehaviour
         if (IsSpawned)
         {
             CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-            // Active player calls OnShotStart locally — recording runs on the owner's machine
             if (gm != null) gm.OnShotStart();
-
             rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
         }
         else
@@ -198,7 +250,6 @@ public class StrikerController : NetworkBehaviour
 
         if (IsSpawned)
         {
-            // Active player calls OnShotComplete locally — recording stops on the owner's machine
             if (gm2 != null) gm2.OnShotComplete();
         }
         else
@@ -206,30 +257,8 @@ public class StrikerController : NetworkBehaviour
             playerTurn = false;
         }
 
-        // Single-player turn flip — striker stays active in multiplayer
         if (!IsSpawned)
             gameObject.SetActive(false);
-    }
-
-    private void OnMouseDrag()
-    {
-        if (!IsOwner && IsSpawned) return;
-        if (!isCharging) return;
-
-        Vector3 direction = transform.position - Camera.main.ScreenToWorldPoint(Input.mousePosition);
-        direction.z = 0f;
-        strikerForceField.LookAt(transform.position + direction);
-
-        float scaleValue = Mathf.Clamp01(direction.magnitude / maxDragDistance) * maxScale;
-        strikerForceField.localScale = new Vector3(scaleValue, scaleValue, scaleValue);
-
-        // Sync: broadcast look target and scale so spectator's arrow mirrors the drag
-        if (IsSpawned)
-        {
-            Vector3 lookTarget = transform.position + direction;
-            Vector3 scale      = new Vector3(scaleValue, scaleValue, scaleValue);
-            SyncForceFieldServerRpc(true, lookTarget, scale);
-        }
     }
 
     // -------------------------------------------------------------------------

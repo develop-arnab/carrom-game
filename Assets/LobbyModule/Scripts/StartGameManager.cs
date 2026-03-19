@@ -25,6 +25,7 @@ public class StartGameManager : MonoBehaviour {
 
     public void StartHost() {
         NetworkManager.Singleton.StartHost();
+        LoadingSceneManager.Instance.Init();
         LoadingSceneManager.Instance.LoadScene(nextScene);
     }
 

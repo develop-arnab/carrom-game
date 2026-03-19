@@ -257,13 +257,7 @@ public class CarromGameManager : NetworkBehaviour
 
         telemetryRecorder?.StartRecording();
 
-        // BatchTransmitter.NotifyShotStart must run on the server to send RPCs.
-        // If we are the server (Host shooting), call directly.
-        // If we are the client, ask the server to broadcast the freeze.
-        if (IsServer)
-            batchTransmitter?.NotifyShotStart();
-        else
-            batchTransmitter?.RequestShotStartServerRpc();
+        batchTransmitter?.StartShotAsActivePlayer();
     }
 
     /// <summary>

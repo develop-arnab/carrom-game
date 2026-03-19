@@ -112,7 +112,7 @@ public class CharacterSelectionManager : SingletonNetwork<CharacterSelectionMana
 
     void OnDisable()
     {
-        if (IsServer)
+        if (NetworkManager.Singleton != null && IsServer)
         {
             NetworkManager.Singleton.OnClientDisconnectCallback -= PlayerDisconnects;
         }

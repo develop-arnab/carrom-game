@@ -20,6 +20,12 @@ public class NetworkPhysicsObject : NetworkBehaviour
     public float CurrentSpeed { get; private set; }
     private Vector2 previousPosition;
 
+    [Header("Soft Braking")]
+    [Tooltip("Speed below which the exponential brake engages (world units/s).")]
+    [SerializeField] private float brakingThreshold  = 0.5f;
+    [Tooltip("Velocity multiplier applied per FixedUpdate tick while braking. Lower = faster stop.")]
+    [SerializeField] private float brakingMultiplier = 0.85f;
+
     // -------------------------------------------------------------------------
     // LIFECYCLE
     // -------------------------------------------------------------------------
@@ -54,6 +60,15 @@ public class NetworkPhysicsObject : NetworkBehaviour
             // Take the max: Box2D velocity wins during a real shot,
             // kinematic delta wins when the slider moves the piece directly
             CurrentSpeed = Mathf.Max(rb.linearVelocity.magnitude, kinematicSpeed);
+
+            // Exponential soft brake — eliminates Box2D's long float-to-zero tail.
+            // Only engages in the slow-roll window; full-speed shots are unaffected.
+            float vel = rb.linearVelocity.magnitude;
+            if (vel > 0.01f && vel < brakingThreshold)
+            {
+                rb.linearVelocity  *= brakingMultiplier;
+                rb.angularVelocity *= brakingMultiplier;
+            }
         }
         else
         {

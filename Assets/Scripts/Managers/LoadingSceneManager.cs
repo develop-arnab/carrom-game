@@ -16,7 +16,8 @@ public enum SceneName : byte
     Defeat,
     SinglePlayerLobbyMenu,
     TicTacToe,
-    Carrom 
+    Carrom,
+    Menu
     //.
     //.
     // Add more scenes states if needed

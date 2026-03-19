@@ -14,18 +14,21 @@ public class LocalCharacterSelectionUI : MonoBehaviour
     [Header("UI References")]
     public Image characterImage;
     public TextMeshProUGUI characterNameText;
-    public GameObject border; // optional, same as container in CharacterSelection
-    public GameObject borderReady; // optional
+    public GameObject border;
+    public GameObject borderReady;
     public Button leftButton;
     public Button rightButton;
     public Button startHostButton;
     public Button startClientButton;
     public Button authButton;
-    public Button readyButton; // optional if you want a ready toggle locally
+    public Button readyButton;
     public AudioClip changeClip;
     public AudioClip confirmClip;
     [SerializeField] private Button joinLobbyButton;
     [SerializeField] private TMP_InputField joinLobbyCode;
+    [SerializeField] private TextMeshProUGUI createdLobbyCodeText;
+    [SerializeField] private GameObject createdLobbyCodeContainer;
+    [SerializeField] private Button backButton;
 
     private int m_selectedIndex = 0;
     private SceneName nextScene = SceneName.CharacterSelection;
@@ -53,6 +56,9 @@ public class LocalCharacterSelectionUI : MonoBehaviour
 
         RefreshUI();
 
+        if (createdLobbyCodeContainer != null) createdLobbyCodeContainer.SetActive(false);
+        LobbyManager.Instance.OnJoinedLobby += LobbyManager_OnJoinedLobby;
+
         // Hook buttons
         if (leftButton != null) leftButton.onClick.AddListener(() => ChangeSelection(-1));
         if (rightButton != null) rightButton.onClick.AddListener(() => ChangeSelection(1));
@@ -64,6 +70,8 @@ public class LocalCharacterSelectionUI : MonoBehaviour
             LobbyManager.Instance.JoinLobbyByCode(joinLobbyCode.text);
         });
         }
+        if (backButton != null)
+            backButton.onClick.AddListener(() => PanelManager.Open("main"));
 /*        if (authButton != null)  {  
         authButton.onClick.AddListener(() => {*/
             Debug.Log("CLICKED AUTH");
@@ -72,6 +80,20 @@ public class LocalCharacterSelectionUI : MonoBehaviour
             LobbyManager.Instance.Authenticate(playerName);
      /*   });
         }*/
+    }
+
+    private void OnDestroy()
+    {
+        if (LobbyManager.Instance != null)
+            LobbyManager.Instance.OnJoinedLobby -= LobbyManager_OnJoinedLobby;
+    }
+
+    private void LobbyManager_OnJoinedLobby(object sender, LobbyManager.LobbyEventArgs e)
+    {
+        if (createdLobbyCodeText != null)
+            createdLobbyCodeText.text = e.lobby.LobbyCode;
+        if (createdLobbyCodeContainer != null)
+            createdLobbyCodeContainer.SetActive(true);
     }
 
     private void Update()
@@ -135,6 +157,7 @@ public class LocalCharacterSelectionUI : MonoBehaviour
             true,
             gameMode
         );
+        if (startHostButton != null) startHostButton.interactable = false;
         // AudioManager.Instance.PlaySoundEffect(m_confirmClip);
         /*LoadingSceneManager.Instance.LoadScene(nextScene);*/
         // Persist selection into static holder (already stored by ChangeSelection)

@@ -5,6 +5,7 @@ using TMPro;
 using UnityEngine.UI;
 using Unity.Services.Authentication;
 using Unity.Services.Friends;
+using Unity.Services.Friends.Notifications;
 
 public class FriendsMenu : Panel
 {
@@ -17,6 +18,12 @@ public class FriendsMenu : Panel
     [SerializeField] private Button friendRequestsReceivedButton = null;
     [SerializeField] private Button friendRequestsSentButton = null;
     [SerializeField] private Button closeButton = null;
+    [SerializeField] private Button addFriendButton = null;
+    [SerializeField] private TMP_InputField addFriendInput = null;
+
+    // Which tab is currently showing — so push events can refresh the right view
+    private enum Tab { Friends, Received, Sent }
+    private Tab currentTab = Tab.Friends;
 
     public override void Initialize()
     {
@@ -28,18 +35,70 @@ public class FriendsMenu : Panel
         friendRequestsReceivedButton.onClick.AddListener(LoadReceivedFriendRequests);
         friendRequestsSentButton.onClick.AddListener(LoadSentFriendRequests);
         closeButton.onClick.AddListener(ClosePanel);
+        if (addFriendButton != null) addFriendButton.onClick.AddListener(AddFriendByName);
         ClearFriendsList();
         base.Initialize();
     }
-    
+
     public override void Open()
     {
         base.Open();
+        // Subscribe to push notifications so the list stays live
+        FriendsService.Instance.RelationshipAdded   += OnRelationshipChanged;
+        FriendsService.Instance.RelationshipDeleted += OnRelationshipChanged;
         LoadFriendsList();
+    }
+
+    public override void Close()
+    {
+        // Guard against Close() being called during Panel.Initialize() before Friends is ready
+        try
+        {
+            FriendsService.Instance.RelationshipAdded   -= OnRelationshipChanged;
+            FriendsService.Instance.RelationshipDeleted -= OnRelationshipChanged;
+        }
+        catch { }
+        base.Close();
+    }
+
+    // Push notification handler — refreshes whichever tab is open
+    private void OnRelationshipChanged(IRelationshipAddedEvent e)   => RefreshCurrentTab();
+    private void OnRelationshipChanged(IRelationshipDeletedEvent e) => RefreshCurrentTab();
+
+    private void RefreshCurrentTab()
+    {
+        switch (currentTab)
+        {
+            case Tab.Friends:  LoadFriendsList();             break;
+            case Tab.Received: LoadReceivedFriendRequests();  break;
+            case Tab.Sent:     LoadSentFriendRequests();      break;
+        }
+    }
+
+    private async void AddFriendByName()
+    {
+        if (addFriendInput == null || string.IsNullOrWhiteSpace(addFriendInput.text)) return;
+
+        string name = addFriendInput.text.Trim();
+        addFriendButton.interactable = false;
+        try
+        {
+            await FriendsService.Instance.AddFriendByNameAsync(name);
+            addFriendInput.text = "";
+            // Refresh sent requests tab to show the new outgoing request
+            LoadSentFriendRequests();
+        }
+        catch
+        {
+            ErrorMenu panel = (ErrorMenu)PanelManager.GetSingleton("error");
+            panel.Open(ErrorMenu.Action.None, "Could not find a player with that name.", "OK");
+        }
+        addFriendButton.interactable = true;
     }
     
     private void LoadFriendsList()
     {
+        currentTab = Tab.Friends;
         friendsButton.interactable = false;
         friendRequestsReceivedButton.interactable = true;
         friendRequestsSentButton.interactable = true;
@@ -56,6 +115,7 @@ public class FriendsMenu : Panel
 
     private void LoadReceivedFriendRequests()
     {
+        currentTab = Tab.Received;
         friendsButton.interactable = true;
         friendRequestsReceivedButton.interactable = false;
         friendRequestsSentButton.interactable = true;
@@ -72,6 +132,7 @@ public class FriendsMenu : Panel
 
     private void LoadSentFriendRequests()
     {
+        currentTab = Tab.Sent;
         friendsButton.interactable = true;
         friendRequestsReceivedButton.interactable = true;
         friendRequestsSentButton.interactable = false;

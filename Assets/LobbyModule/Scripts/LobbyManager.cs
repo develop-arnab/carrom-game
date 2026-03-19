@@ -45,7 +45,8 @@ public class LobbyManager : MonoBehaviour {
 
     public enum GameMode {
         TicTacToe,
-        RollDice
+        RollDice,
+        Carrom
     }
 
     public enum PlayerCharacter {
@@ -66,6 +67,20 @@ public class LobbyManager : MonoBehaviour {
     private SceneName nextScene = SceneName.CharacterSelection;
     private void Awake() {
         Instance = this;
+    }
+
+    // Persists the lobby join code across scene loads so UI in CharacterSelection can display it
+    public static string LastLobbyCode { get; private set; } = "";
+
+    private void Start() {
+        // If Unity Services is already initialized and player is signed in (from MainMenuManager),
+        // grab the player name from AuthenticationService directly.
+        if (Unity.Services.Core.UnityServices.State == Unity.Services.Core.ServicesInitializationState.Initialized
+            && AuthenticationService.Instance.IsSignedIn)
+        {
+            playerName = AuthenticationService.Instance.PlayerName ?? AuthenticationService.Instance.PlayerId;
+            Debug.Log("[LobbyManager] Using existing auth session, player: " + playerName);
+        }
     }
 
     private void Update() {
@@ -132,15 +147,6 @@ public class LobbyManager : MonoBehaviour {
                 if (!IsLobbyHost()) {
                     if (joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value != "") {
                         JoinGame(joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value);
-                    }
-                }
-
-                if (!alreadyStartedGame) {
-                    if (IsLobbyHost()) {
-                        if (joinedLobby.Players.Count == 2) {
-                            // Two players have joined, start game
-                            StartGame();
-                        }
                     }
                 }
 
@@ -223,8 +229,13 @@ public class LobbyManager : MonoBehaviour {
 
         OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
 
-        Debug.Log("Created Lobby " + lobby.Name + " with Code " + lobby.LobbyCode );
-        /*LoadingSceneManager.Instance.LoadScene(nextScene);*/
+        Debug.Log("Created Lobby " + lobby.Name + " with Code " + lobby.LobbyCode);
+
+        // Host goes to CharacterSelection immediately — don't wait for player 2
+        IsHost = true;
+        alreadyStartedGame = true;
+        LastLobbyCode = lobby.LobbyCode;
+        OnLobbyStartGame?.Invoke(this, new LobbyEventArgs { lobby = lobby });
     }
 
     public async void RefreshLobbyList() {
@@ -257,14 +268,18 @@ public class LobbyManager : MonoBehaviour {
 
     public async void JoinLobbyByCode(string lobbyCode) {
         Player player = GetPlayer();
-
-        Lobby lobby = await LobbyService.Instance.JoinLobbyByCodeAsync(lobbyCode, new JoinLobbyByCodeOptions {
-            Player = player
-        });
-
-        joinedLobby = lobby;
-
-        OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+        try {
+            Lobby lobby = await LobbyService.Instance.JoinLobbyByCodeAsync(lobbyCode, new JoinLobbyByCodeOptions {
+                Player = player
+            });
+            joinedLobby = lobby;
+            LastLobbyCode = lobby.LobbyCode;
+            OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+        } catch (LobbyServiceException e) {
+            Debug.Log(e);
+            ErrorMenu panel = (ErrorMenu)PanelManager.GetSingleton("error");
+            panel.Open(ErrorMenu.Action.None, "Failed to join lobby. Check the code and try again.", "OK");
+        }
     }
 
     public async void JoinLobby(Lobby lobby) {
@@ -340,6 +355,30 @@ public class LobbyManager : MonoBehaviour {
             OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
         } catch (LobbyServiceException e) {
             Debug.Log(e);
+        }
+    }
+
+    /// <summary>
+    /// Tries to quick-join an existing public Carrom lobby.
+    /// If none is available, creates a new public lobby and waits for an opponent.
+    /// </summary>
+    public async void QuickJoinOrCreatePublicLobby() {
+        try {
+            QuickJoinLobbyOptions quickJoinOptions = new QuickJoinLobbyOptions {
+                Filter = new List<QueryFilter> {
+                    new QueryFilter(QueryFilter.FieldOptions.AvailableSlots, "0", QueryFilter.OpOptions.GT)
+                },
+                Player = GetPlayer()
+            };
+
+            Lobby lobby = await LobbyService.Instance.QuickJoinLobbyAsync(quickJoinOptions);
+            joinedLobby = lobby;
+            Debug.Log("[LobbyManager] Quick-joined existing lobby: " + lobby.Name);
+            OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+        } catch (LobbyServiceException) {
+            // No open lobby found — create a new public one
+            Debug.Log("[LobbyManager] No open lobby found — creating new public Carrom lobby");
+            CreateLobby("Carrom", 2, false, GameMode.Carrom);
         }
     }
 

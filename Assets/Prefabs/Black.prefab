@@ -304,6 +304,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ShowTopMostFoldoutHeaderGroup: 1
+  brakingThreshold: 0.5
+  brakingMultiplier: 0.85
 --- !u!114 &7924861763708765020
 MonoBehaviour:
   m_ObjectHideFlags: 0

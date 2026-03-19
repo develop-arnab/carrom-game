@@ -4,13 +4,16 @@ using UnityEngine;
 namespace Carrom.Telemetry
 {
     /// <summary>
-    /// Assembles incoming replay chunks into a complete recording,
-    /// then plays back in FixedUpdate using Rigidbody2D.MovePosition for
-    /// perfectly smooth, physics-rate animation on the spectator's screen.
+    /// Live Streaming Receiver. Ingests PhysicsFrames into a Queue as they arrive
+    /// and plays them back in FixedUpdate using a 2-chunk (100-frame) safety buffer.
+    ///
+    /// State machine:
+    ///   Idle      → waiting for first chunk
+    ///   Buffering → accumulating frames until buffer threshold or end state arrives
+    ///   Playing   → dequeuing one frame per FixedUpdate tick
     ///
     /// Pieces MUST be: bodyType=Kinematic, interpolation=Interpolate during playback.
-    /// NT and NRB2D have been removed from all prefabs (Path A).
-    /// ApplyEndState uses direct transform assignment + velocity wipe — no NT/Teleport.
+    /// NT and NRB2D removed from all prefabs (Path A).
     /// </summary>
     public class PlaybackEngine : MonoBehaviour
     {
@@ -19,11 +22,24 @@ namespace Carrom.Telemetry
         [SerializeField] private BatchTransmitter batchTransmitter;
         [SerializeField] private AudioClip        collisionClip;
 
-        // Download assembly
-        private PhysicsFrame[]  downloadedReplay;
-        private int             receivedChunks;
-        private int             totalChunks;
-        private bool            downloadComplete;
+        private const int BUFFER_THRESHOLD = 40; // 2 chunks — ~2s at 50Hz
+
+        // -------------------------------------------------------------------------
+        // STATE MACHINE
+        // -------------------------------------------------------------------------
+
+        private enum PlaybackState { Idle, Buffering, Playing }
+        private PlaybackState state = PlaybackState.Idle;
+
+        // Live frame queue
+        private Queue<PhysicsFrame> frameQueue = new Queue<PhysicsFrame>();
+
+        // Chunk tracking
+        private int  receivedChunks;
+        private int  totalChunks;
+        private int  currentIndex;
+
+        // End state
         private EndStatePayload pendingEndState;
         private bool            hasEndState;
 
@@ -32,46 +48,48 @@ namespace Carrom.Telemetry
         private int                audioTrackIndex;
         private bool               hasAudioTrack;
 
-        // Playback state
-        private int  currentIndex;
-        private bool isPlaying;
-
         // Graveyard detection — pocket sound for spectator
         private const float GraveyardThreshold = 900f;
         private AudioSource pocketAudioSource;
 
-        public bool IsPlaying => isPlaying;
+        public bool IsPlaying => state == PlaybackState.Playing;
 
         public void SetPieceRegistry(PieceRegistry r) => pieceRegistry = r;
 
-        // Temporary list used during chunk assembly
-        private List<PhysicsFrame[]> chunkList = new List<PhysicsFrame[]>();
+        private void Start()
+        {
+            BoardScript board = FindObjectOfType<BoardScript>();
+            if (board != null) pocketAudioSource = board.GetComponent<AudioSource>();
+        }
 
         // -------------------------------------------------------------------------
-        // CHUNK ASSEMBLY
+        // CHUNK INGESTION
         // -------------------------------------------------------------------------
 
         public void ReceiveChunk(PhysicsFrame[] chunkFrames, int chunkIndex, int totalChunksCount)
         {
             if (chunkIndex == 0)
             {
-                downloadedReplay = null;
-                receivedChunks   = 0;
-                totalChunks      = totalChunksCount;
-                downloadComplete = false;
-                hasEndState      = false;
-                isPlaying        = false;
-                currentIndex     = 0;
-                audioTrack       = null;
-                audioTrackIndex  = 0;
-                hasAudioTrack    = false;
-                chunkList.Clear();
+                frameQueue.Clear();
+                state           = PlaybackState.Buffering;
+                receivedChunks  = 0;
+                currentIndex    = 0;
+                totalChunks     = 0;
+                hasEndState     = false;
+                // Audio state intentionally NOT reset here — audio slices may arrive
+                // before Chunk 0 due to network ordering. Wiped in FinishPlayback/StopPlayback.
             }
 
-            chunkList.Add(chunkFrames);
+            foreach (PhysicsFrame frame in chunkFrames)
+                frameQueue.Enqueue(frame);
+
             receivedChunks++;
 
-            Debug.Log($"[PlaybackEngine] Assembled chunk {receivedChunks}/{totalChunks}");
+            // totalChunksCount == 0 → live chunk, more coming
+            // totalChunksCount  > 0 → final sweep chunk, real total now known
+            if (totalChunksCount > 0)
+                totalChunks = totalChunksCount;
+
             TryStartPlayback();
         }
 
@@ -79,122 +97,129 @@ namespace Carrom.Telemetry
         {
             pendingEndState = endState;
             hasEndState     = true;
-            Debug.Log("[PlaybackEngine] End state received");
             TryStartPlayback();
         }
 
         public void ReceiveAudioTrack(ReplayAudioEvent[] track)
         {
-            audioTrack      = track;
-            audioTrackIndex = 0;
-            hasAudioTrack   = true;
-            Debug.Log($"[PlaybackEngine] Audio track received — {track.Length} events");
-        }
-
-        private void TryStartPlayback()
-        {
-            if (receivedChunks < totalChunks || !hasEndState) return;
-            if (isPlaying) return;
-
-            int totalFrames = 0;
-            foreach (var c in chunkList) totalFrames += c.Length;
-
-            downloadedReplay = new PhysicsFrame[totalFrames];
-            int offset = 0;
-            foreach (var c in chunkList)
+            // Arrives in incremental slices — append rather than replace
+            if (audioTrack == null)
             {
-                System.Array.Copy(c, 0, downloadedReplay, offset, c.Length);
-                offset += c.Length;
+                audioTrack      = track;
+                audioTrackIndex = 0;
+                hasAudioTrack   = true;
             }
-            chunkList.Clear();
-
-            currentIndex     = 0;
-            downloadComplete = true;
-            isPlaying        = true;
-
-            Debug.Log($"[PlaybackEngine] Download complete — starting playback of {totalFrames} frames");
+            else
+            {
+                int oldLen = audioTrack.Length;
+                ReplayAudioEvent[] merged = new ReplayAudioEvent[oldLen + track.Length];
+                System.Array.Copy(audioTrack, merged, oldLen);
+                System.Array.Copy(track, 0, merged, oldLen, track.Length);
+                audioTrack    = merged;
+                hasAudioTrack = true;
+            }
         }
 
         // -------------------------------------------------------------------------
-        // FIXEDUPDATE PLAYBACK — LOCKED, DO NOT MODIFY
+        // BUFFER GATEKEEPER
+        // -------------------------------------------------------------------------
+
+        private void TryStartPlayback()
+        {
+            if (state != PlaybackState.Buffering) return;
+
+            // Start playing once buffer is full OR the shot is already over (short shot)
+            if (frameQueue.Count >= BUFFER_THRESHOLD || hasEndState)
+            {
+                state = PlaybackState.Playing;
+                Debug.Log($"[PlaybackEngine] Buffer filled ({frameQueue.Count} frames). Live playback started!");
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // FIXEDUPDATE PLAYBACK
         // -------------------------------------------------------------------------
 
         private void FixedUpdate()
         {
-            if (!isPlaying || downloadedReplay == null) return;
+            if (state != PlaybackState.Playing) return;
 
-            if (currentIndex >= downloadedReplay.Length)
+            if (frameQueue.Count > 0)
             {
-                FinishPlayback();
-                return;
-            }
+                PhysicsFrame frame = frameQueue.Dequeue();
 
-            PhysicsFrame frame = downloadedReplay[currentIndex];
-
-            for (int i = 0; i < frame.pieceCount; i++)
-            {
-                PieceState  state = frame.pieces[i];
-                GameObject  piece = pieceRegistry?.GetPiece(state.pieceId);
-                if (piece == null) continue;
-
-                Rigidbody2D rb = piece.GetComponent<Rigidbody2D>();
-                if (rb != null)
+                for (int i = 0; i < frame.pieceCount; i++)
                 {
-                    // Graveyard detection: incoming position is off-screen but piece is still on board
-                    // → this is the exact frame the active player pocketed this coin
-                    if (state.xPosition >= GraveyardThreshold && piece.transform.position.x < GraveyardThreshold)
-                    {
-                        if (pocketAudioSource == null)
-                        {
-                            BoardScript board = FindObjectOfType<BoardScript>();
-                            if (board != null) pocketAudioSource = board.GetComponent<AudioSource>();
-                        }
-                        pocketAudioSource?.Play();
-                        SpriteRenderer sr = piece.GetComponent<SpriteRenderer>();
-                        if (sr != null) SpawnGhostCoin(sr.sprite, piece.transform.position);
-                    }
+                    PieceState  pieceState = frame.pieces[i];
+                    GameObject  piece      = pieceRegistry?.GetPiece(pieceState.pieceId);
+                    if (piece == null) continue;
 
-                    rb.MovePosition(new Vector2(state.xPosition, state.yPosition));
-                    rb.MoveRotation(state.zRotation);
+                    Rigidbody2D rb = piece.GetComponent<Rigidbody2D>();
+                    if (rb != null)
+                    {
+                        // Graveyard detection: incoming position is off-screen but piece is still on board
+                        // → this is the exact frame the active player pocketed this coin
+                        if (pieceState.xPosition >= GraveyardThreshold && piece.transform.position.x < GraveyardThreshold)
+                        {
+                            pocketAudioSource?.Play();
+                            SpriteRenderer sr = piece.GetComponent<SpriteRenderer>();
+                            if (sr != null) SpawnGhostCoin(sr.sprite, piece.transform.position);
+                        }
+
+                        rb.MovePosition(new Vector2(pieceState.xPosition, pieceState.yPosition));
+                        rb.MoveRotation(pieceState.zRotation);
+                    }
+                }
+
+                currentIndex++;
+
+                // Audio track playback — fire any events whose frameIndex matches the current visual frame.
+                // Loop handles multiple sounds on the same frame (e.g. striker hits two coins simultaneously).
+                if (hasAudioTrack && audioTrack != null && collisionClip != null)
+                {
+                    while (audioTrackIndex < audioTrack.Length &&
+                           audioTrack[audioTrackIndex].frameIndex <= currentIndex)
+                    {
+                        ReplayAudioEvent evt = audioTrack[audioTrackIndex];
+                        AudioSource.PlayClipAtPoint(collisionClip,
+                            new Vector3(evt.position.x, evt.position.y, 0f),
+                            evt.volume);
+                        audioTrackIndex++;
+                    }
                 }
             }
-
-            currentIndex++;
-
-            // Audio track playback — fire any events whose frameIndex matches the current visual frame.
-            // Loop handles multiple sounds on the same frame (e.g. striker hits two coins simultaneously).
-            if (hasAudioTrack && audioTrack != null && collisionClip != null)
+            else
             {
-                while (audioTrackIndex < audioTrack.Length &&
-                       audioTrack[audioTrackIndex].frameIndex <= currentIndex)
+                // Queue drained
+                if (hasEndState)
                 {
-                    ReplayAudioEvent evt = audioTrack[audioTrackIndex];
-                    AudioSource.PlayClipAtPoint(collisionClip,
-                        new Vector3(evt.position.x, evt.position.y, 0f),
-                        evt.volume);
-                    audioTrackIndex++;
+                    state = PlaybackState.Idle;
+                    FinishPlayback();
+                }
+                else
+                {
+                    // Network lag underflow — pause and re-buffer
+                    state = PlaybackState.Buffering;
+                    Debug.LogWarning("[PlaybackEngine] Network lag! Buffering...");
                 }
             }
         }
 
         // -------------------------------------------------------------------------
-        // FINISH
+        // FINISH — untouched
         // -------------------------------------------------------------------------
 
         private void FinishPlayback()
         {
-            isPlaying = false;
             Debug.Log("[PlaybackEngine] Playback complete — applying end state");
-
-            // 1. Hard-snap all pieces to their authoritative final positions and wipe velocity
             ApplyEndState(pendingEndState);
-
-            // 2. Restore pieces to Dynamic (velocity already zeroed inside ApplyEndState,
-            //    but SetSpectatorPiecesKinematic also zeroes as a safety net)
             batchTransmitter?.SetSpectatorPiecesKinematic(false);
-
-            // 3. Tell server to transfer authority
             batchTransmitter?.NotifyEndStateAppliedServerRpc();
+
+            // Wipe audio state here — safe to do after playback is fully complete
+            audioTrack      = null;
+            audioTrackIndex = 0;
+            hasAudioTrack   = false;
         }
 
         /// <summary>
@@ -211,11 +236,9 @@ namespace Carrom.Telemetry
                 GameObject piece = pieceRegistry.GetPiece(s.pieceId);
                 if (piece == null) continue;
 
-                // Direct transform assignment — authoritative, instant, no interpolation
                 piece.transform.position = new Vector3(s.xPosition, s.yPosition, piece.transform.position.z);
                 piece.transform.rotation = Quaternion.Euler(0f, 0f, s.zRotation);
 
-                // Zero velocity so physics solver starts from rest when body goes Dynamic
                 Rigidbody2D rb = piece.GetComponent<Rigidbody2D>();
                 if (rb != null)
                 {
@@ -229,21 +252,24 @@ namespace Carrom.Telemetry
 
         public void StopPlayback()
         {
-            isPlaying        = false;
-            currentIndex     = 0;
-            downloadedReplay = null;
+            state        = PlaybackState.Idle;
+            currentIndex = 0;
+            frameQueue.Clear();
+            audioTrack      = null;
+            audioTrackIndex = 0;
+            hasAudioTrack   = false;
         }
 
         // -------------------------------------------------------------------------
-        // GHOST COIN — physics-less visual effect, local only, no network involvement
+        // GHOST COIN — untouched
         // -------------------------------------------------------------------------
 
         private void SpawnGhostCoin(Sprite originalSprite, Vector3 spawnPosition)
         {
             if (originalSprite == null) return;
-            GameObject ghost    = new GameObject("GhostCoin");
+            GameObject ghost         = new GameObject("GhostCoin");
             ghost.transform.position = spawnPosition;
-            SpriteRenderer ghostSr  = ghost.AddComponent<SpriteRenderer>();
+            SpriteRenderer ghostSr   = ghost.AddComponent<SpriteRenderer>();
             ghostSr.sprite           = originalSprite;
             ghostSr.sortingOrder     = 10;
             StartCoroutine(AnimateGhostCoin(ghost, ghostSr));

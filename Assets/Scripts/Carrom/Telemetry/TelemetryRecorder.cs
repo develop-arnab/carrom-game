@@ -13,10 +13,10 @@ public class TelemetryRecorder : MonoBehaviour
     [SerializeField] private PieceRegistry pieceRegistry;
 
     // Visual track
-    private List<PhysicsFrame>      fullShotRecording = new List<PhysicsFrame>(512);
+    private List<PhysicsFrame> fullShotRecording = new List<PhysicsFrame>(512);
 
-    // Audio track — decoupled from PieceState, logged on collision events
-    private List<ReplayAudioEvent>  audioTrack        = new List<ReplayAudioEvent>(64);
+    // Audio track — public so BatchTransmitter can read it live during streaming
+    public List<ReplayAudioEvent> audioTrack { get; private set; } = new List<ReplayAudioEvent>(64);
 
     private bool isRecording;
 

@@ -66,7 +66,8 @@ public class MainMenuManager : MonoBehaviour
 
             if (AuthenticationService.Instance.SessionTokenExists)
             {
-                SignInAnonymouslyAsync();
+                // Resume the existing session (works for both username/password and anonymous)
+                await AuthenticationService.Instance.SignInAnonymouslyAsync();
             }
             else
             {
@@ -101,34 +102,47 @@ public class MainMenuManager : MonoBehaviour
         PanelManager.Open("loading");
         try
         {
-            await AuthenticationService.Instance.SignInWithUsernamePasswordAsync(username, password);
+            bool isNewAccount = false;
+            try
+            {
+                // Try sign-up first — if account already exists, fall through to sign-in
+                await AuthenticationService.Instance.SignUpWithUsernamePasswordAsync(username, password);
+                isNewAccount = true;
+            }
+            catch (RequestFailedException)
+            {
+                // Sign-up failed (likely username taken) — attempt sign-in
+                try
+                {
+                    await AuthenticationService.Instance.SignInWithUsernamePasswordAsync(username, password);
+                }
+                catch (RequestFailedException signInEx) when (signInEx.Message.Contains("WRONG_USERNAME_PASSWORD"))
+                {
+                    PanelManager.Close("loading");
+                    PanelManager.Open("auth");
+                    ((AuthenticationMenu)PanelManager.GetSingleton("auth")).ShowError("Incorrect username or password.");
+                    return;
+                }
+            }
+
+            if (isNewAccount)
+            {
+                // Set display name to match the chosen username
+                await AuthenticationService.Instance.UpdatePlayerNameAsync(username);
+            }
+
+            PanelManager.CloseAll();
+            PanelManager.Open("main");
+            ((MainMenu)PanelManager.GetSingleton("main")).UpdatePlayerNameUI();
         }
-        catch (AuthenticationException exception)
-        {
-            ShowError(ErrorMenu.Action.OpenAuthMenu, "Username or password is wrong.", "OK");
-        }
-        catch (RequestFailedException exception)
+        catch (Exception)
         {
             ShowError(ErrorMenu.Action.OpenAuthMenu, "Failed to connect to the network.", "OK");
         }
     }
-    
-    public async void SignUpWithUsernameAndPasswordAsync(string username, string password)
-    {
-        PanelManager.Open("loading");
-        try
-        {
-            await AuthenticationService.Instance.SignUpWithUsernamePasswordAsync(username, password);
-        }
-        catch (AuthenticationException exception)
-        {
-            ShowError(ErrorMenu.Action.OpenAuthMenu, "Failed to sign you up.", "OK");
-        }
-        catch (RequestFailedException exception)
-        {
-            ShowError(ErrorMenu.Action.OpenAuthMenu, "Failed to connect to the network.", "OK");
-        }
-    }
+
+    public void SignUpWithUsernameAndPasswordAsync(string username, string password)
+        => SignInWithUsernameAndPasswordAsync(username, password);
     
     public void SignOut()
     {
@@ -153,7 +167,8 @@ public class MainMenuManager : MonoBehaviour
         
         AuthenticationService.Instance.Expired += () =>
         {
-            SignInAnonymouslyAsync();
+            PanelManager.CloseAll();
+            PanelManager.Open("auth");
         };
     }
     
@@ -164,21 +179,12 @@ public class MainMenuManager : MonoBehaviour
         panel.Open(action, error, button);
     }
     
-    private async void SignInConfirmAsync()
+    private void SignInConfirmAsync()
     {
-        try
-        {
-            if (string.IsNullOrEmpty(AuthenticationService.Instance.PlayerName))
-            {
-                await AuthenticationService.Instance.UpdatePlayerNameAsync("Player");
-            }
-            PanelManager.CloseAll();
-            PanelManager.Open("main");
-        }
-        catch
-        {
-            
-        }
+        // Used for session token resume — open main panel and refresh name
+        PanelManager.CloseAll();
+        PanelManager.Open("main");
+        ((MainMenu)PanelManager.GetSingleton("main")).UpdatePlayerNameUI();
     }
     
 }

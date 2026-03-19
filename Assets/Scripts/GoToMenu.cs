@@ -12,6 +12,6 @@ public class GoToMenu : MonoBehaviour
         yield return new WaitUntil(() => LoadingSceneManager.Instance != null);
 
         // Load the menu
-        LoadingSceneManager.Instance.LoadScene(SceneName.SinglePlayerLobbyMenu, false);
+        LoadingSceneManager.Instance.LoadScene(SceneName.Menu, false);
     }
 }

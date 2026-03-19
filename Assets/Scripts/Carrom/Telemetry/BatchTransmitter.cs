@@ -1,21 +1,23 @@
-using System.Collections;
 using Unity.Netcode;
 using UnityEngine;
 
 /// <summary>
-/// Symmetrical two-way telemetry pipeline.
+/// Symmetrical two-way live-streaming telemetry pipeline.
 ///
-/// Host shoots  → records locally → TransmitFullReplay sends via ClientRpc  → Client's PlaybackEngine plays it.
-/// Client shoots → records locally → TransmitFullReplay sends via ServerRpc  → Host's PlaybackEngine plays it.
+/// While the shot is in progress, Update() harvests completed 50-frame chunks
+/// from TelemetryRecorder and streams them immediately to the spectator.
+/// When OnShotComplete fires, TransmitFullReplay does a final sweep for any
+/// remaining frames, remaining audio events, and the EndStatePayload.
 ///
-/// The sender never routes data to themselves, so no "active player" filtering
-/// is needed inside the receive RPCs — they always run on the spectator.
+/// Chunk protocol:
+///   totalChunks == 0  → live streaming chunk, more coming
+///   totalChunks  > 0  → final sweep chunk, receiver now knows the real total
 ///
 /// NT and NRB2D removed from all prefabs (Path A). Zero NetworkTransform references.
 /// </summary>
 public class BatchTransmitter : NetworkBehaviour
 {
-    private const int FRAMES_PER_CHUNK = 50;
+    private const int FRAMES_PER_CHUNK = 20;
 
     [Header("References")]
     [SerializeField] private TelemetryRecorder               telemetryRecorder;
@@ -27,14 +29,48 @@ public class BatchTransmitter : NetworkBehaviour
     public void SetCarromGameManager(CarromGameManager m)            => carromGameManager = m;
 
     // -------------------------------------------------------------------------
-    // SHOT START — freeze the spectator's pieces
+    // LIVE STREAMING STATE
+    // -------------------------------------------------------------------------
+
+    private int  lastSentFrameIndex = 0;
+    private int  currentChunkIndex  = 0;
+    private int  lastSentAudioIndex = 0;
+    private bool isLiveStreaming     = false;
+
+    private void ResetCursors()
+    {
+        lastSentFrameIndex = 0;
+        currentChunkIndex  = 0;
+        lastSentAudioIndex = 0;
+        isLiveStreaming    = true;
+    }
+
+    // -------------------------------------------------------------------------
+    // SHOT START — freeze spectator + start streaming
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Called directly when the Host shoots (IsServer=true).
-    /// Freezes the Client's pieces via ClientRpc, and also freezes the Host's
-    /// own pieces if it is the spectator (never the case here, but kept symmetric).
+    /// Called locally by the active player (Host OR Client) at shot start.
+    /// Resets streaming cursors here — on the machine that owns the physics.
+    /// Then routes the spectator freeze to the correct peer.
     /// </summary>
+    public void StartShotAsActivePlayer()
+    {
+        ResetCursors(); // always local — never runs on the wrong machine
+
+        if (IsServer)
+        {
+            ulong activePlayerId = carromGameManager != null
+                ? carromGameManager.GetActivePlayerClientId()
+                : ulong.MaxValue;
+            FreezeSpectatorPiecesClientRpc(activePlayerId);
+        }
+        else
+        {
+            RequestShotStartServerRpc();
+        }
+    }
+
     public void NotifyShotStart()
     {
         if (!IsServer) return;
@@ -43,18 +79,13 @@ public class BatchTransmitter : NetworkBehaviour
             ? carromGameManager.GetActivePlayerClientId()
             : ulong.MaxValue;
 
-        Debug.Log($"[BatchTransmitter] NotifyShotStart — active player: {activePlayerId}");
         FreezeSpectatorPiecesClientRpc(activePlayerId);
 
-        // Freeze Host's own pieces if Host is the spectator
         if (NetworkManager.Singleton.LocalClientId != activePlayerId)
             SetSpectatorPiecesKinematic(true);
+        // NOTE: ResetCursors() intentionally removed — called by StartShotAsActivePlayer instead
     }
 
-    /// <summary>
-    /// Called by the Client owner when it shoots.
-    /// Asks the server to broadcast the freeze RPC to all peers.
-    /// </summary>
     [ServerRpc(RequireOwnership = false)]
     public void RequestShotStartServerRpc(ServerRpcParams _ = default)
     {
@@ -62,84 +93,122 @@ public class BatchTransmitter : NetworkBehaviour
             ? carromGameManager.GetActivePlayerClientId()
             : ulong.MaxValue;
 
-        Debug.Log($"[BatchTransmitter] RequestShotStartServerRpc — active player: {activePlayerId}");
         FreezeSpectatorPiecesClientRpc(activePlayerId);
 
-        // Freeze Host's own pieces — Host is the spectator when Client shoots
         if (NetworkManager.Singleton.LocalClientId != activePlayerId)
             SetSpectatorPiecesKinematic(true);
+        // NOTE: ResetCursors() intentionally removed — runs on Host, not the active Client
     }
 
     [ClientRpc]
     private void FreezeSpectatorPiecesClientRpc(ulong activePlayerId)
     {
-        if (NetworkManager.Singleton.LocalClientId == activePlayerId)
-        {
-            Debug.Log("[BatchTransmitter] I am the active player — skipping freeze");
-            return;
-        }
-        Debug.Log("[BatchTransmitter] I am the spectator — freezing pieces");
+        if (NetworkManager.Singleton.LocalClientId == activePlayerId) return;
         SetSpectatorPiecesKinematic(true);
     }
 
     // -------------------------------------------------------------------------
-    // SHOT END — transmit replay to the peer (two-way)
+    // UPDATE — live harvester
     // -------------------------------------------------------------------------
 
-    /// <summary>
-    /// Called by the active player (Host or Client) after OnShotComplete.
-    /// Routes the replay to the correct peer based on who is sending.
-    /// </summary>
+    private void Update()
+    {
+        if (!IsSpawned || !isLiveStreaming || telemetryRecorder == null) return;
+
+        // Visual harvesting — send a chunk every time 50 new frames are ready
+        while (telemetryRecorder.FrameCount - lastSentFrameIndex >= FRAMES_PER_CHUNK)
+        {
+            PhysicsFrame[] allFrames = telemetryRecorder.GetFullRecording();
+            PhysicsFrame[] chunk     = new PhysicsFrame[FRAMES_PER_CHUNK];
+            System.Array.Copy(allFrames, lastSentFrameIndex, chunk, 0, FRAMES_PER_CHUNK);
+
+            // totalChunks = 0 signals "live chunk, more coming"
+            if (IsServer)
+                DeliverChunkToClientClientRpc(chunk, currentChunkIndex, 0);
+            else
+                DeliverChunkToServerServerRpc(chunk, currentChunkIndex, 0);
+
+            lastSentFrameIndex += FRAMES_PER_CHUNK;
+            currentChunkIndex++;
+        }
+
+        // Audio harvesting — send any new events that arrived since last check
+        if (telemetryRecorder.audioTrack.Count > lastSentAudioIndex)
+        {
+            int newCount = telemetryRecorder.audioTrack.Count - lastSentAudioIndex;
+            ReplayAudioEvent[] slice = new ReplayAudioEvent[newCount];
+            telemetryRecorder.audioTrack.CopyTo(lastSentAudioIndex, slice, 0, newCount);
+
+            if (IsServer)
+                DeliverAudioTrackToClientClientRpc(slice);
+            else
+                DeliverAudioTrackToServerServerRpc(slice);
+
+            lastSentAudioIndex = telemetryRecorder.audioTrack.Count;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SHOT END — final sweep
+    // -------------------------------------------------------------------------
+
     public void TransmitFullReplay(EndStatePayload endState)
     {
         if (!IsSpawned) return;
         if (telemetryRecorder == null) { Debug.LogError("[BatchTransmitter] TelemetryRecorder is null"); return; }
 
-        PhysicsFrame[] allFrames = telemetryRecorder.GetFullRecording();
-        if (allFrames == null || allFrames.Length == 0)
+        isLiveStreaming = false;
+
+        PhysicsFrame[] allFrames    = telemetryRecorder.GetFullRecording();
+        int            remaining    = allFrames != null ? allFrames.Length - lastSentFrameIndex : 0;
+        int            finalTotal   = currentChunkIndex + (remaining > 0 ? 1 : 0);
+
+        // If no chunks were ever sent (very short shot), finalTotal must be at least 1
+        if (finalTotal == 0) finalTotal = 1;
+
+        if (remaining > 0)
         {
-            Debug.LogWarning("[BatchTransmitter] No frames to transmit");
-            return;
-        }
+            PhysicsFrame[] lastChunk = new PhysicsFrame[remaining];
+            System.Array.Copy(allFrames, lastSentFrameIndex, lastChunk, 0, remaining);
 
-        Debug.Log($"[BatchTransmitter] Transmitting {allFrames.Length} frames (IsServer={IsServer})");
-        StartCoroutine(SendChunksCoroutine(allFrames, endState));
-    }
-
-    private IEnumerator SendChunksCoroutine(PhysicsFrame[] allFrames, EndStatePayload endState)
-    {
-        int totalChunks = Mathf.CeilToInt((float)allFrames.Length / FRAMES_PER_CHUNK);
-
-        for (int i = 0; i < totalChunks; i++)
-        {
-            int start = i * FRAMES_PER_CHUNK;
-            int count = Mathf.Min(FRAMES_PER_CHUNK, allFrames.Length - start);
-            PhysicsFrame[] chunk = new PhysicsFrame[count];
-            System.Array.Copy(allFrames, start, chunk, 0, count);
-
+            // finalTotal > 0 signals "this is the last chunk"
             if (IsServer)
-                DeliverChunkToClientClientRpc(chunk, i, totalChunks);
+                DeliverChunkToClientClientRpc(lastChunk, currentChunkIndex, finalTotal);
             else
-                DeliverChunkToServerServerRpc(chunk, i, totalChunks);
-
-            Debug.Log($"[BatchTransmitter] Sent chunk {i + 1}/{totalChunks} ({count} frames)");
-            yield return null;
-        }
-
-        // Send audio track before end state so PlaybackEngine has it ready
-        ReplayAudioEvent[] audioTrack = telemetryRecorder.GetAudioTrack();
-        if (IsServer)
-        {
-            DeliverAudioTrackToClientClientRpc(audioTrack);
-            DeliverEndStateToClientClientRpc(endState);
+                DeliverChunkToServerServerRpc(lastChunk, currentChunkIndex, finalTotal);
         }
         else
         {
-            DeliverAudioTrackToServerServerRpc(audioTrack);
-            DeliverEndStateToServerServerRpc(endState);
+            // No leftover frames — but receiver still needs to know the final total.
+            // Re-send the last chunk index with the real totalChunks so TryStartPlayback fires.
+            // Edge case: zero chunks sent at all (instant pocket). Send an empty final chunk.
+            PhysicsFrame[] empty = new PhysicsFrame[0];
+            if (IsServer)
+                DeliverChunkToClientClientRpc(empty, currentChunkIndex, finalTotal);
+            else
+                DeliverChunkToServerServerRpc(empty, currentChunkIndex, finalTotal);
         }
 
-        Debug.Log($"[BatchTransmitter] Audio track ({audioTrack.Length} events) + end state transmitted.");
+        // Flush any remaining audio events
+        if (telemetryRecorder.audioTrack.Count > lastSentAudioIndex)
+        {
+            int newCount = telemetryRecorder.audioTrack.Count - lastSentAudioIndex;
+            ReplayAudioEvent[] slice = new ReplayAudioEvent[newCount];
+            telemetryRecorder.audioTrack.CopyTo(lastSentAudioIndex, slice, 0, newCount);
+
+            if (IsServer)
+                DeliverAudioTrackToClientClientRpc(slice);
+            else
+                DeliverAudioTrackToServerServerRpc(slice);
+        }
+
+        // End state — triggers TryStartPlayback on the receiver
+        if (IsServer)
+            DeliverEndStateToClientClientRpc(endState);
+        else
+            DeliverEndStateToServerServerRpc(endState);
+
+        Debug.Log($"[BatchTransmitter] Final sweep complete — {finalTotal} total chunks, end state sent.");
     }
 
     // -------------------------------------------------------------------------
@@ -150,7 +219,6 @@ public class BatchTransmitter : NetworkBehaviour
     private void DeliverChunkToClientClientRpc(PhysicsFrame[] chunkFrames, int chunkIndex, int totalChunks)
     {
         if (IsServer) return;
-        Debug.Log($"[BatchTransmitter] CLIENT received chunk {chunkIndex + 1}/{totalChunks}");
         playbackEngine?.ReceiveChunk(chunkFrames, chunkIndex, totalChunks);
     }
 
@@ -158,7 +226,6 @@ public class BatchTransmitter : NetworkBehaviour
     private void DeliverAudioTrackToClientClientRpc(ReplayAudioEvent[] audioTrack)
     {
         if (IsServer) return;
-        Debug.Log($"[BatchTransmitter] CLIENT received audio track ({audioTrack.Length} events)");
         playbackEngine?.ReceiveAudioTrack(audioTrack);
     }
 
@@ -166,7 +233,6 @@ public class BatchTransmitter : NetworkBehaviour
     private void DeliverEndStateToClientClientRpc(EndStatePayload endState)
     {
         if (IsServer) return;
-        Debug.Log("[BatchTransmitter] CLIENT received end state");
         playbackEngine?.ReceiveEndState(endState);
     }
 
@@ -177,21 +243,18 @@ public class BatchTransmitter : NetworkBehaviour
     [ServerRpc(RequireOwnership = false)]
     private void DeliverChunkToServerServerRpc(PhysicsFrame[] chunkFrames, int chunkIndex, int totalChunks, ServerRpcParams _ = default)
     {
-        Debug.Log($"[BatchTransmitter] HOST received chunk {chunkIndex + 1}/{totalChunks}");
         playbackEngine?.ReceiveChunk(chunkFrames, chunkIndex, totalChunks);
     }
 
     [ServerRpc(RequireOwnership = false)]
     private void DeliverAudioTrackToServerServerRpc(ReplayAudioEvent[] audioTrack, ServerRpcParams _ = default)
     {
-        Debug.Log($"[BatchTransmitter] HOST received audio track ({audioTrack.Length} events)");
         playbackEngine?.ReceiveAudioTrack(audioTrack);
     }
 
     [ServerRpc(RequireOwnership = false)]
     private void DeliverEndStateToServerServerRpc(EndStatePayload endState, ServerRpcParams _ = default)
     {
-        Debug.Log("[BatchTransmitter] HOST received end state");
         playbackEngine?.ReceiveEndState(endState);
     }
 
@@ -199,11 +262,6 @@ public class BatchTransmitter : NetworkBehaviour
     // PLAYBACK COMPLETE → transfer authority
     // -------------------------------------------------------------------------
 
-    /// <summary>
-    /// Called by PlaybackEngine on the spectator when replay finishes.
-    /// If spectator is the Client, it sends a ServerRpc.
-    /// If spectator is the Host, it calls TriggerAuthorityTransfer directly.
-    /// </summary>
     [ServerRpc(RequireOwnership = false)]
     public void NotifyEndStateAppliedServerRpc(ServerRpcParams _ = default)
     {
