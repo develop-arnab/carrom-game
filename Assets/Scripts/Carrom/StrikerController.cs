@@ -10,6 +10,11 @@ public class StrikerController : NetworkBehaviour
     [SerializeField] Transform strikerForceField;
     [SerializeField] Slider strikerSlider;
 
+    // --- AAA Aiming Tuning ---
+    [SerializeField] float visualLengthMultiplier = 2.5f;
+    [SerializeField] float aimDeadzone            = 0.2f;
+    [SerializeField] float aimSmoothSpeed         = 15f;
+
     bool isMoving;
     bool isCharging;
     bool isDragging;          // true while finger/mouse is locked onto the striker
@@ -62,15 +67,66 @@ public class StrikerController : NetworkBehaviour
         ResetToBaseline();
     }
 
+    /// <summary>
+    /// NGO ownership callback — fires on the OLD owner (now spectator) the moment
+    /// authority leaves. Snaps the striker to the opponent's baseline immediately,
+    /// bypassing the SyncAimClientRpc race condition entirely.
+    /// </summary>
+    public override void OnLostOwnership()
+    {
+        base.OnLostOwnership();
+        Debug.Log("[StrikerController] Ownership lost — snapping to opponent baseline");
+
+        // Wipe any residual physics / UI state
+        isMoving   = false;
+        isCharging = false;
+        isDragging = false;
+        if (rb != null)
+        {
+            rb.linearVelocity  = Vector2.zero;
+            rb.angularVelocity = 0f;
+        }
+
+        // Hide force field
+        if (strikerForceField != null)
+        {
+            strikerForceField.gameObject.SetActive(false);
+            strikerForceField.localScale = Vector3.zero;
+        }
+
+        // Ensure sprite is visible
+        SpriteRenderer sr = GetComponent<SpriteRenderer>();
+        if (sr != null) sr.enabled = true;
+
+        // Snap to the NEW owner's baseline (opponent's side)
+        // Host lost ownership → new owner is Client → Client sits at top (3.45f)
+        // Client lost ownership → new owner is Server → Server sits at bottom (-4.57f)
+        float opponentY = IsServer ? 3.45f : -4.57f;
+        float sliderX   = strikerSlider != null ? strikerSlider.value : 0f;
+        transform.position = new Vector3(sliderX, opponentY, 0f);
+    }
+
     // -------------------------------------------------------------------------
     // RESET — single source of truth for striker ready-state
     // -------------------------------------------------------------------------
 
     /// <summary>
+    /// Fired by the server when the active player earns an extra turn (turn retention).
+    /// Resets the striker to baseline without an ownership transfer.
+    /// </summary>
+    [ClientRpc]
+    public void RetainTurnResetClientRpc()
+    {
+        if (!IsOwner) return; // only the active player needs to reset
+        Debug.Log("[StrikerController] RetainTurnResetClientRpc — resetting for extra turn");
+        ResetToBaseline();
+    }
+
+    /// <summary>
     /// Wipes physics state, snaps the striker to the new owner's Y-baseline,
     /// and broadcasts the position so the spectator sees it immediately.
     /// </summary>
-    private void ResetToBaseline()
+    public void ResetToBaseline()
     {
         // Wipe physics residuals
         isMoving   = false;
@@ -85,6 +141,10 @@ public class StrikerController : NetworkBehaviour
         // Hide force field
         if (strikerForceField != null)
             strikerForceField.localScale = Vector3.zero;
+
+        // Ensure striker sprite is always visible on reset
+        SpriteRenderer sr = GetComponent<SpriteRenderer>();
+        if (sr != null) sr.enabled = true;
 
         if (!IsSpawned)
         {
@@ -184,23 +244,55 @@ public class StrikerController : NetworkBehaviour
         {
             Vector3 direction = transform.position - worldPos;
             direction.z = 0f;
-            strikerForceField.LookAt(transform.position + direction);
 
-            float scaleValue = Mathf.Clamp01(direction.magnitude / maxDragDistance) * maxScale;
-            strikerForceField.localScale = new Vector3(scaleValue, scaleValue, scaleValue);
+            if (direction.magnitude < aimDeadzone)
+            {
+                // Inside deadzone — hide arrow but keep grip
+                strikerForceField.localScale = Vector3.zero;
+            }
+            else
+            {
+                // Smooth rotation via Slerp
+                Vector3 smoothedForward = Vector3.Slerp(
+                    strikerForceField.forward,
+                    direction.normalized,
+                    Time.deltaTime * aimSmoothSpeed
+                );
+                strikerForceField.LookAt(transform.position + smoothedForward);
 
-            if (IsSpawned)
-                SyncForceFieldServerRpc(true, transform.position + direction, new Vector3(scaleValue, scaleValue, scaleValue));
+                // Visual length decoupled from physics drag
+                float dragPercentage = Mathf.Clamp01(direction.magnitude / maxDragDistance);
+                float scaleValue     = dragPercentage * maxScale * visualLengthMultiplier;
+                strikerForceField.localScale = new Vector3(scaleValue, scaleValue, scaleValue);
+
+                if (IsSpawned)
+                    SyncForceFieldServerRpc(true, transform.position + smoothedForward, new Vector3(scaleValue, scaleValue, scaleValue));
+            }
         }
 
         // --- RELEASE ---
         if (released && isDragging)
         {
-            isDragging = false;
-            if (!isMoving)
+            Vector3 finalDirection = transform.position - worldPos;
+            finalDirection.z = 0f;
+
+            if (finalDirection.magnitude < aimDeadzone)
             {
-                isMoving = true;
-                StartCoroutine(FireShot(worldPos));
+                // Released inside deadzone — cancel the shot
+                isDragging = false;
+                isCharging = false;
+                strikerForceField.gameObject.SetActive(false);
+                if (IsSpawned)
+                    SyncForceFieldServerRpc(false, Vector3.zero, Vector3.zero);
+            }
+            else
+            {
+                isDragging = false;
+                if (!isMoving)
+                {
+                    isMoving = true;
+                    StartCoroutine(FireShot(worldPos));
+                }
             }
         }
 

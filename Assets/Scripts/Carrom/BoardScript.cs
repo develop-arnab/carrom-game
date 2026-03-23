@@ -5,19 +5,14 @@ using Unity.Netcode;
 
 /// <summary>
 /// Handles pocket triggers using the Graveyard pattern.
-///
-/// Key changes from original:
-/// - Owner check replaces IsServer guard so the active Client processes their own triggers.
-/// - Despawn/Destroy replaced with off-screen teleport so PlaybackEngine replay is never broken.
-/// - Score writes go through ServerRpcs so the Client can update NetworkVariables safely.
+/// Scoring is fully delegated to CarromGameManager via the Shot Ledger.
+/// BoardScript only handles: physics (SendToGraveyard) + ledger reporting.
 /// </summary>
 public class BoardScript : NetworkBehaviour
 {
-    public static int scoreEnemy  = 0;
-    public static int scorePlayer = 0;
-
-    // Off-screen graveyard position — far enough to never interfere with physics
-    private static readonly Vector3 GraveyardPosition = new Vector3(1000f, 1000f, 0f);
+    // Off-screen graveyard base — pocket coords are encoded as (1000 + x, 1000 + y)
+    // Tweak in the Inspector to nudge the ghost spawn point onto the visual pocket center.
+    [SerializeField] private Vector2 ghostSpawnOffset = Vector2.zero;
 
     private TextMeshProUGUI popUpText;
 
@@ -48,13 +43,13 @@ public class BoardScript : NetworkBehaviour
                 HandleStriker(other);
                 break;
             case "Black":
-                HandleBlack(other);
+                HandleBlack(other, transform.position);
                 break;
             case "White":
-                HandleWhite(other);
+                HandleWhite(other, transform.position);
                 break;
             case "Queen":
-                HandleQueen(other);
+                HandleQueen(other, transform.position);
                 break;
         }
     }
@@ -66,88 +61,41 @@ public class BoardScript : NetworkBehaviour
     private void HandleStriker(Collider2D other)
     {
         other.gameObject.GetComponent<Rigidbody2D>().linearVelocity = Vector2.zero;
-
-        bool isPlayerTurn = StrikerController.playerTurn;
-        string msg = "Striker Lost! -1 to " + (isPlayerTurn ? "Player" : "Enemy");
-
-        if (IsSpawned)
-        {
-            if (isPlayerTurn) AddPlayerScoreServerRpc(-1);
-            else              AddEnemyScoreServerRpc(-1);
-            ShowPopupTextClientRpc(msg);
-        }
-        else
-        {
-            if (isPlayerTurn) scorePlayer--;
-            else              scoreEnemy--;
-            StartCoroutine(textPopUp(msg));
-        }
+        if (IsSpawned) ReportPocketedCoinServerRpc(CoinType.Striker);
     }
 
-    private void HandleBlack(Collider2D other)
+    private void HandleBlack(Collider2D other, Vector3 pocketCenter)
     {
-        SendToGraveyard(other);
-
-        string msg = "Black Coin Entered! +1 to Enemy";
-        if (IsSpawned)
-        {
-            AddEnemyScoreServerRpc(1);
-            ShowPopupTextClientRpc(msg);
-        }
-        else
-        {
-            scoreEnemy++;
-            StartCoroutine(textPopUp(msg));
-        }
+        SendToGraveyard(other, pocketCenter);
+        if (IsSpawned) ReportPocketedCoinServerRpc(CoinType.Black);
     }
 
-    private void HandleWhite(Collider2D other)
+    private void HandleWhite(Collider2D other, Vector3 pocketCenter)
     {
-        SendToGraveyard(other);
-
-        string msg = "White Coin Entered! +1 to Player";
-        if (IsSpawned)
-        {
-            AddPlayerScoreServerRpc(1);
-            ShowPopupTextClientRpc(msg);
-        }
-        else
-        {
-            scorePlayer++;
-            StartCoroutine(textPopUp(msg));
-        }
+        SendToGraveyard(other, pocketCenter);
+        if (IsSpawned) ReportPocketedCoinServerRpc(CoinType.White);
     }
 
-    private void HandleQueen(Collider2D other)
+    private void HandleQueen(Collider2D other, Vector3 pocketCenter)
     {
-        SendToGraveyard(other);
-
-        bool isPlayerTurn = StrikerController.playerTurn;
-        string msg = "Queen Entered! +2 to " + (isPlayerTurn ? "Player" : "Enemy");
-
-        if (IsSpawned)
-        {
-            if (isPlayerTurn) AddPlayerScoreServerRpc(2);
-            else              AddEnemyScoreServerRpc(2);
-            ShowPopupTextClientRpc(msg);
-        }
-        else
-        {
-            if (isPlayerTurn) scorePlayer += 2;
-            else              scoreEnemy  += 2;
-            StartCoroutine(textPopUp(msg));
-        }
+        SendToGraveyard(other, pocketCenter);
+        if (IsSpawned) ReportPocketedCoinServerRpc(CoinType.Queen);
     }
 
     // -------------------------------------------------------------------------
     // GRAVEYARD — teleport off-screen instead of despawning
     // -------------------------------------------------------------------------
 
-    private static void SendToGraveyard(Collider2D other)
+    private static void SendToGraveyard(Collider2D other, Vector3 pocketCenter)
     {
-        // Grab sprite before teleporting so the ghost spawns at the pocket position
         SpriteRenderer sr = other.gameObject.GetComponent<SpriteRenderer>();
-        if (sr != null) Instance.SpawnGhostCoin(sr.sprite, other.transform.position);
+        if (sr != null)
+        {
+            // Slide ghost from coin's current position into the pocket center
+            Instance.SpawnGhostCoin(sr.sprite, other.transform.position, pocketCenter + (Vector3)Instance.ghostSpawnOffset, other.transform.localScale);
+            // Hide original sprite immediately to mask the Graveyard teleport streak
+            sr.enabled = false;
+        }
 
         Rigidbody2D rb = other.gameObject.GetComponent<Rigidbody2D>();
         if (rb != null)
@@ -155,7 +103,8 @@ public class BoardScript : NetworkBehaviour
             rb.linearVelocity  = Vector2.zero;
             rb.angularVelocity = 0f;
         }
-        other.transform.position = GraveyardPosition;
+        // Encode pocket center into graveyard position so PlaybackEngine can decode it exactly
+        other.transform.position = new Vector3(1000f + pocketCenter.x, 1000f + pocketCenter.y, 0f);
     }
 
     // -------------------------------------------------------------------------
@@ -166,32 +115,37 @@ public class BoardScript : NetworkBehaviour
     private static BoardScript Instance;
     private void Awake() { Instance = this; }
 
-    private void SpawnGhostCoin(Sprite originalSprite, Vector3 spawnPosition)
+    private void SpawnGhostCoin(Sprite originalSprite, Vector3 entryPosition, Vector3 pocketCenter, Vector3 originalScale)
     {
         if (originalSprite == null) return;
         GameObject ghost = new GameObject("GhostCoin");
-        ghost.transform.position = spawnPosition;
+        ghost.transform.position = entryPosition;
         SpriteRenderer ghostSr = ghost.AddComponent<SpriteRenderer>();
         ghostSr.sprite          = originalSprite;
         ghostSr.sortingOrder    = 10; // render on top
-        StartCoroutine(AnimateGhostCoin(ghost, ghostSr));
+        StartCoroutine(AnimateGhostCoin(ghost, ghostSr, entryPosition, pocketCenter, originalScale));
     }
 
-    private IEnumerator AnimateGhostCoin(GameObject ghost, SpriteRenderer ghostSr)
+    private IEnumerator AnimateGhostCoin(GameObject ghost, SpriteRenderer ghostSr, Vector3 entryPosition, Vector3 pocketCenter, Vector3 originalScale)
     {
-        float   duration   = 0.6f;
-        float   elapsed    = 0f;
-        Vector3 startScale = Vector3.one * 0.7f;
-        Vector3 endScale   = Vector3.one * 0.4f;
-        Color   baseColor  = ghostSr.color;
-        Color   startColor = new Color(baseColor.r, baseColor.g, baseColor.b, 0.6f);
-        Color   endColor   = new Color(baseColor.r, baseColor.g, baseColor.b, 0f);
-        ghostSr.color      = startColor;
+        float      duration   = 0.55f;
+        float      elapsed    = 0f;
+        Vector3    startScale = originalScale;
+        Vector3    endScale   = Vector3.one * 0.08f;
+        Color      baseColor  = ghostSr.color;
+        Color      startColor = new Color(baseColor.r, baseColor.g, baseColor.b, 0.35f);
+        Color      endColor   = new Color(baseColor.r, baseColor.g, baseColor.b, 0f);
+        ghostSr.color         = startColor;
+        Quaternion startRot   = ghost.transform.rotation;
+        Quaternion endRot     = startRot * Quaternion.Euler(60f, 0f, Random.Range(-15f, 15f));
 
         while (elapsed < duration)
         {
-            float t = elapsed / duration;
+            float t      = elapsed / duration;
+            float easeT  = 1f - Mathf.Pow(1f - t, 3f); // ease-out cubic
+            ghost.transform.position   = Vector3.Lerp(entryPosition, pocketCenter, easeT);
             ghost.transform.localScale = Vector3.Lerp(startScale, endScale, t);
+            ghost.transform.rotation   = Quaternion.Slerp(startRot, endRot, easeT);
             ghostSr.color              = Color.Lerp(startColor, endColor, t);
             elapsed += Time.deltaTime;
             yield return null;
@@ -205,23 +159,18 @@ public class BoardScript : NetworkBehaviour
     // -------------------------------------------------------------------------
 
     [ServerRpc(RequireOwnership = false)]
-    private void AddPlayerScoreServerRpc(int amount)
+    private void ReportPocketedCoinServerRpc(CoinType coinType)
     {
         CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-        if (gm != null) gm.networkScorePlayer.Value += amount;
-    }
-
-    [ServerRpc(RequireOwnership = false)]
-    private void AddEnemyScoreServerRpc(int amount)
-    {
-        CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-        if (gm != null) gm.networkScoreEnemy.Value += amount;
+        gm?.ReportPocketedCoin(coinType);
     }
 
     // -------------------------------------------------------------------------
-    // UI
+    // UI — disabled pending synced VFX implementation
+    // Popup text is desynced from the 800ms visual buffer, so silenced for now.
     // -------------------------------------------------------------------------
 
+    /*
     [ClientRpc]
     private void ShowPopupTextClientRpc(string message)
     {
@@ -235,4 +184,5 @@ public class BoardScript : NetworkBehaviour
         yield return new WaitForSeconds(3f);
         popUpText.gameObject.SetActive(false);
     }
+    */
 }

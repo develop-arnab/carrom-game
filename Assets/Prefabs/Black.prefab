@@ -278,7 +278,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d5a57f767e5e46a458fc5d3c628d0cbb, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  GlobalObjectIdHash: 3733578772
+  GlobalObjectIdHash: 2817990048
   InScenePlacedSourceGlobalObjectIdHash: 0
   DeferredDespawnTick: 0
   Ownership: 1
@@ -304,7 +304,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ShowTopMostFoldoutHeaderGroup: 1
-  brakingThreshold: 0.5
+  brakingThreshold: 0.3
   brakingMultiplier: 0.85
 --- !u!114 &7924861763708765020
 MonoBehaviour:
@@ -319,8 +319,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   slidingClip: {fileID: 8300000, guid: 978e7c02c7a132c459a4343e9d8fef53, type: 3}
-  minSpeed: 0.3
-  maxSpeed: 20
+  minSpeed: 0.1
+  maxSpeed: 30
   maxVolume: 1
   volumeLerpSpeed: 10
   minPitch: 0.8

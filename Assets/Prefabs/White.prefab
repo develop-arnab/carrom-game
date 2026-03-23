@@ -167,8 +167,8 @@ AudioSource:
   m_Enabled: 1
   serializedVersion: 4
   OutputAudioMixerGroup: {fileID: 0}
-  m_audioClip: {fileID: 8300000, guid: e0c692d54f161de448c1f6972b5ecc40, type: 3}
-  m_Resource: {fileID: 8300000, guid: e0c692d54f161de448c1f6972b5ecc40, type: 3}
+  m_audioClip: {fileID: 8300000, guid: 02f5e3d3e07684644821b7e72b2745f3, type: 3}
+  m_Resource: {fileID: 8300000, guid: 02f5e3d3e07684644821b7e72b2745f3, type: 3}
   m_PlayOnAwake: 0
   m_Volume: 0.205
   m_Pitch: 1
@@ -304,6 +304,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ShowTopMostFoldoutHeaderGroup: 1
+  brakingThreshold: 0.3
+  brakingMultiplier: 0.85
 --- !u!114 &6455927736887719356
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -317,8 +319,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   slidingClip: {fileID: 8300000, guid: 978e7c02c7a132c459a4343e9d8fef53, type: 3}
-  minSpeed: 0.3
-  maxSpeed: 20
+  minSpeed: 0.1
+  maxSpeed: 30
   maxVolume: 1
   volumeLerpSpeed: 10
   minPitch: 0.8

@@ -373,6 +373,7 @@ public class LobbyManager : MonoBehaviour {
 
             Lobby lobby = await LobbyService.Instance.QuickJoinLobbyAsync(quickJoinOptions);
             joinedLobby = lobby;
+            LastLobbyCode = lobby.LobbyCode ?? "";
             Debug.Log("[LobbyManager] Quick-joined existing lobby: " + lobby.Name);
             OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
         } catch (LobbyServiceException) {

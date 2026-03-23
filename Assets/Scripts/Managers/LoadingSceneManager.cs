@@ -17,6 +17,7 @@ public enum SceneName : byte
     SinglePlayerLobbyMenu,
     TicTacToe,
     Carrom,
+    CarromNew,
     Menu
     //.
     //.

@@ -77,6 +77,14 @@ public class CharacterSelectionManager : SingletonNetwork<CharacterSelectionMana
     [SerializeField]
     GameObject m_playerPrefab;
 
+    [Header("Ruleset")]
+    [SerializeField] private TMP_Dropdown rulesetDropdown;
+
+    public NetworkVariable<GameMode> netCarromRuleset = new NetworkVariable<GameMode>(
+        GameMode.Freestyle,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server);
+
     [Header("Audio clips")]
     [SerializeField]
     AudioClip m_confirmClip;
@@ -92,6 +100,13 @@ public class CharacterSelectionManager : SingletonNetwork<CharacterSelectionMana
     void Start()
     {
         m_timer = m_timeToStartGame;
+
+        // Dropdown: Host can change ruleset, Client is read-only
+        if (rulesetDropdown != null)
+        {
+            rulesetDropdown.interactable = IsServer;
+            rulesetDropdown.onValueChanged.AddListener(OnRulesetDropdownChanged);
+        }
     }
 
     void Update()
@@ -120,6 +135,10 @@ public class CharacterSelectionManager : SingletonNetwork<CharacterSelectionMana
 
     void StartGame()
     {
+        // Pass the selected ruleset to CarromGameManager before the scene loads
+        CarromGameManager.ActiveRuleset = netCarromRuleset.Value;
+        Debug.Log($"[CharacterSelectionManager] ActiveRuleset set to {CarromGameManager.ActiveRuleset}");
+
         /*LobbyManager.Instance.StartGame();*/
         StartGameClientRpc();
         LoadingSceneManager.Instance.LoadScene(m_nextScene);
@@ -273,6 +292,17 @@ public class CharacterSelectionManager : SingletonNetwork<CharacterSelectionMana
 
     public void ServerSceneInit(ulong clientId)
     {
+        // --- IDEMPOTENCY GUARD ---
+        for (int i = 0; i < m_playerStates.Length; i++)
+        {
+            if (m_playerStates[i].playerState != ConnectionState.disconnected &&
+                m_playerStates[i].clientId == clientId)
+            {
+                Debug.LogWarning($"[CharacterSelectionManager] Client {clientId} is already initialized. Intercepting double-spawn.");
+                return;
+            }
+        }
+
         GameObject go =
             NetworkObjectSpawner.SpawnNewNetworkObjectChangeOwnershipToClient(
                 m_playerPrefab,
@@ -493,11 +523,54 @@ public class CharacterSelectionManager : SingletonNetwork<CharacterSelectionMana
         m_playerStates[playerId].playerState = ConnectionState.disconnected;
     }
 
+    private void ResetAllCharacterData()
+    {
+        for (int i = 0; i < charactersData.Length; i++)
+        {
+            charactersData[i].isSelected = false;
+            charactersData[i].clientId   = 0UL;
+            charactersData[i].playerId   = -1;
+        }
+        Debug.Log("[CharacterSelectionManager] ScriptableObject data scrubbed for new match.");
+    }
+
     public override void OnNetworkSpawn()
     {
+        // 1. Force wipe persistent ScriptableObject state on all machines
+        ResetAllCharacterData();
+
         if (IsServer)
         {
             NetworkManager.Singleton.OnClientDisconnectCallback += PlayerDisconnects;
+
+            // 2. Warm Boot Protocol: re-initialize clients already in the session
+            foreach (ulong clientId in NetworkManager.Singleton.ConnectedClientsIds)
+            {
+                Debug.Log($"[CharacterSelectionManager] Warm Boot: Initializing existing client {clientId}");
+                ServerSceneInit(clientId);
+            }
         }
+
+        // 3. Sync dropdown to network state on both sides
+        netCarromRuleset.OnValueChanged += (oldMode, newMode) =>
+        {
+            if (rulesetDropdown != null)
+                rulesetDropdown.value = (int)newMode;
+        };
+
+        // Initialise dropdown to current value (handles late-join)
+        if (rulesetDropdown != null)
+            rulesetDropdown.value = (int)netCarromRuleset.Value;
+    }
+
+    /// <summary>
+    /// Host-only: updates the network ruleset and un-readies all ready players
+    /// so they must re-confirm after a mode change.
+    /// </summary>
+    private void OnRulesetDropdownChanged(int index)
+    {
+        if (!IsServer) return;
+        netCarromRuleset.Value = (GameMode)index;
+        Debug.Log($"[CharacterSelectionManager] Ruleset changed to {(GameMode)index}");
     }
 }

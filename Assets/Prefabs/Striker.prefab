@@ -344,6 +344,9 @@ MonoBehaviour:
   maxDragDistance: 2
   strikerForceField: {fileID: 1223522394}
   strikerSlider: {fileID: 0}
+  visualLengthMultiplier: 2.5
+  aimDeadzone: 0.2
+  aimSmoothSpeed: 15
 --- !u!58 &8536452893684715782
 CircleCollider2D:
   m_ObjectHideFlags: 0
@@ -420,6 +423,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ShowTopMostFoldoutHeaderGroup: 1
+  brakingThreshold: 0.5
+  brakingMultiplier: 0.85
 --- !u!82 &4936949577725782509
 AudioSource:
   m_ObjectHideFlags: 0
@@ -433,13 +438,13 @@ AudioSource:
   m_audioClip: {fileID: 8300000, guid: ce8b6c16cd863cf45913c755d4eef59e, type: 3}
   m_Resource: {fileID: 8300000, guid: ce8b6c16cd863cf45913c755d4eef59e, type: 3}
   m_PlayOnAwake: 0
-  m_Volume: 0.715
+  m_Volume: 0.402
   m_Pitch: 1
   Loop: 0
   Mute: 0
   Spatialize: 0
   SpatializePostEffects: 0
-  Priority: 128
+  Priority: 209
   DopplerLevel: 1
   MinDistance: 1
   MaxDistance: 500
