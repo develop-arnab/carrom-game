@@ -5515,6 +5515,7 @@ GameObject:
   - component: {fileID: 1527715090}
   - component: {fileID: 1527715091}
   - component: {fileID: 1527715092}
+  - component: {fileID: 1527715094}
   m_Layer: 0
   m_Name: Game Manager
   m_TagString: Untagged
@@ -5702,6 +5703,8 @@ MonoBehaviour:
         byte0059: 0
         byte0060: 0
         byte0061: 0
+  activeSeatIndex:
+    m_InternalValue: 0
   scoreTextEnemy: {fileID: 710136697}
   scoreTextPlayer: {fileID: 797763613}
   hostNameText: {fileID: 78405516}
@@ -5726,6 +5729,7 @@ MonoBehaviour:
     serializedVersion: 2
     m_Bits: 64
   velocityThreshold: 0.1
+  aiBrain: {fileID: 1527715094}
 --- !u!114 &1527715091
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -5864,6 +5868,50 @@ MonoBehaviour:
   AutoObjectParentSync: 1
   SyncOwnerTransformWhenParented: 1
   AllowOwnerToParent: 0
+--- !u!114 &1527715094
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1527715088}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 90b7168f745bf4c4da105bee36c69152, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  ShowTopMostFoldoutHeaderGroup: 1
+  striker: {fileID: 278632700}
+  pieceRegistry: {fileID: 1072035665}
+  boardScript: {fileID: 1858789024331264433}
+  raycastLayerMask:
+    serializedVersion: 2
+    m_Bits: 64
+  coinRadius: 0.27
+  cutAngleWeight: 0.5
+  distanceWeight: 0.3
+  clusteringWeight: 0.2
+  minThinkTime: 2
+  maxThinkTime: 5
+  aimingSpeed: 16
+  positionSnapThreshold: 0.05
+  strikerRadius: 0.388
+  depenetrationGap: 0.01
+  pathClearanceMultiplier: 1.4
+  gimmeMaxCoinToPocket: 3
+  gimmeMaxCutAngleDeg: 15
+  gimmeForce: 30
+  linearDrag: 1.5
+  dragDistanceScale: 0.1
+  minForce: 10
+  maxForce: 100
+  clusterDetectionRadius: 1.5
+  clusterBreakForceBase: 12
+  clusterBreakForcePerCoin: 2
+  nudgeForce: 7
+  difficulty: 2
+  angleJitterMaxDeg: 8
+  forceJitterMaxFraction: 0.15
 --- !u!1001 &1566320492
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -7683,6 +7731,17 @@ GameObject:
   m_CorrespondingSourceObject: {fileID: 6469751144476887390, guid: 72e13da6112dd2a4d940b8922e6eb1b0, type: 3}
   m_PrefabInstance: {fileID: 1858789024331264431}
   m_PrefabAsset: {fileID: 0}
+--- !u!114 &1858789024331264433 stripped
+MonoBehaviour:
+  m_CorrespondingSourceObject: {fileID: 4550174806135637985, guid: 72e13da6112dd2a4d940b8922e6eb1b0, type: 3}
+  m_PrefabInstance: {fileID: 1858789024331264431}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1858789024331264432}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 962b2b4c50614f348abaf730e3a78df9, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
 --- !u!1001 &2422384922965093783
 PrefabInstance:
   m_ObjectHideFlags: 0

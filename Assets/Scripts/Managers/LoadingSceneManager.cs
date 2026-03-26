@@ -18,7 +18,8 @@ public enum SceneName : byte
     TicTacToe,
     Carrom,
     CarromNew,
-    Menu
+    Menu,
+    StartGameLobby
     //.
     //.
     // Add more scenes states if needed

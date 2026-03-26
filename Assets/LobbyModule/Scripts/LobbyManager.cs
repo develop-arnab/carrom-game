@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Unity.Services.Authentication;
 using Unity.Services.Core;
 using Unity.Services.Lobbies;
@@ -66,7 +67,13 @@ public class LobbyManager : MonoBehaviour {
     [SerializeField]
     private SceneName nextScene = SceneName.CharacterSelection;
     private void Awake() {
+        if (Instance != null && Instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
         Instance = this;
+        DontDestroyOnLoad(gameObject);
     }
 
     // Persists the lobby join code across scene loads so UI in CharacterSelection can display it
@@ -145,11 +152,16 @@ public class LobbyManager : MonoBehaviour {
                 OnJoinedLobbyUpdate?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
 
                 if (!IsLobbyHost()) {
-                    if (joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value != "") {
-                        JoinGame(joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value);
+                    string relayCode = joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value;
+                    if (!string.IsNullOrEmpty(relayCode) && !alreadyStartedGame) {
+                        // Client found the relay code — join the NGO session in the waiting room.
+                        // Do NOT fire OnLobbyStartGame here; that would trigger a scene load.
+                        alreadyStartedGame = true;
+                        RelayJoinCode = relayCode;
+                        Debug.Log($"[LobbyManager] Client found relay code — joining NGO session: {relayCode}");
+                        await StartGameManager.Instance.JoinRelayAsync(relayCode);
                     }
                 }
-
 
                 if (!IsPlayerInLobby()) {
                     // Player was kicked out of this lobby
@@ -209,7 +221,12 @@ public class LobbyManager : MonoBehaviour {
         }
     }
 
-    public async void CreateLobby(string lobbyName, int maxPlayers, bool isPrivate, GameMode gameMode) {
+    /// <param name="isHostLobby">
+    /// When true, suppresses auto-navigation: OnLobbyStartGame is NOT fired and
+    /// IsHost/alreadyStartedGame are NOT set. The host stays in the lobby scene
+    /// waiting for players. LastLobbyCode is always set regardless of this flag.
+    /// </param>
+    public async void CreateLobby(string lobbyName, int maxPlayers, bool isPrivate, GameMode gameMode, bool isHostLobby = false) {
 
         Debug.Log("Creating LOBBY ");
         Player player = GetPlayer();
@@ -226,16 +243,21 @@ public class LobbyManager : MonoBehaviour {
         Lobby lobby = await LobbyService.Instance.CreateLobbyAsync(lobbyName, maxPlayers, options);
 
         joinedLobby = lobby;
+        LastLobbyCode = lobby.LobbyCode; // always persist — UI reads this after spawn
 
         OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
 
         Debug.Log("Created Lobby " + lobby.Name + " with Code " + lobby.LobbyCode);
 
-        // Host goes to CharacterSelection immediately — don't wait for player 2
-        IsHost = true;
-        alreadyStartedGame = true;
-        LastLobbyCode = lobby.LobbyCode;
-        OnLobbyStartGame?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+        if (!isHostLobby)
+        {
+            // Legacy path: auto-navigate immediately (used by old 1v1 flow)
+            IsHost = true;
+            alreadyStartedGame = true;
+            OnLobbyStartGame?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+        }
+        // isHostLobby == true: host stays in lobby scene, waits for players,
+        // and triggers game start explicitly via StartGameLobbyManager.OnStartGameClicked()
     }
 
     public async void RefreshLobbyList() {
@@ -360,9 +382,12 @@ public class LobbyManager : MonoBehaviour {
 
     /// <summary>
     /// Tries to quick-join an existing public Carrom lobby.
-    /// If none is available, creates a new public lobby and waits for an opponent.
+    /// If none is available, creates a new public lobby and becomes host.
+    /// Returns true if this player is the host (created the lobby),
+    /// false if they joined an existing one as a client.
+    /// The caller is responsible for calling CreateRelayAsync() or JoinRelayAsync() after.
     /// </summary>
-    public async void QuickJoinOrCreatePublicLobby() {
+    public async Task<bool> QuickJoinOrCreatePublicLobbyAsync() {
         try {
             QuickJoinLobbyOptions quickJoinOptions = new QuickJoinLobbyOptions {
                 Filter = new List<QueryFilter> {
@@ -374,13 +399,38 @@ public class LobbyManager : MonoBehaviour {
             Lobby lobby = await LobbyService.Instance.QuickJoinLobbyAsync(quickJoinOptions);
             joinedLobby = lobby;
             LastLobbyCode = lobby.LobbyCode ?? "";
+            IsHost = false; // joined existing — we are a client
             Debug.Log("[LobbyManager] Quick-joined existing lobby: " + lobby.Name);
             OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+            return false; // client
         } catch (LobbyServiceException) {
-            // No open lobby found — create a new public one
+            // No open lobby found — create a new public one and become host
             Debug.Log("[LobbyManager] No open lobby found — creating new public Carrom lobby");
-            CreateLobby("Carrom", 2, false, GameMode.Carrom);
+            int playerCount = StartGameLobbyManager.LocalPlayerCount;
+            await CreateLobbyAsync("Carrom", playerCount, false, GameMode.Carrom);
+            return true; // host
         }
+    }
+
+    /// <summary>
+    /// Async-awaitable lobby creation. Always isHostLobby = true (no auto-navigation).
+    /// </summary>
+    public async Task CreateLobbyAsync(string lobbyName, int maxPlayers, bool isPrivate, GameMode gameMode) {
+        Player player = GetPlayer();
+        CreateLobbyOptions options = new CreateLobbyOptions {
+            Player = player,
+            IsPrivate = isPrivate,
+            Data = new Dictionary<string, DataObject> {
+                { KEY_GAME_MODE, new DataObject(DataObject.VisibilityOptions.Public, gameMode.ToString()) },
+                { KEY_RELAY_JOIN_CODE, new DataObject(DataObject.VisibilityOptions.Member, "") }
+            }
+        };
+        Lobby lobby = await LobbyService.Instance.CreateLobbyAsync(lobbyName, maxPlayers, options);
+        joinedLobby = lobby;
+        LastLobbyCode = lobby.LobbyCode;
+        IsHost = true;
+        Debug.Log($"[LobbyManager] Created lobby: {lobby.Name} ({lobby.LobbyCode})");
+        OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
     }
 
     public async void LeaveLobby() {
@@ -448,17 +498,10 @@ public class LobbyManager : MonoBehaviour {
     }
 
     private void JoinGame(string relayJoinCode) {
-        Debug.Log("JoinGame " + relayJoinCode);
-        if (string.IsNullOrEmpty(relayJoinCode)) {
-            Debug.Log("Invalid Relay code, wait");
-            return;
-        }
-
-        IsHost = false;
-        RelayJoinCode = relayJoinCode;
-        // SceneManager.LoadScene(5);
-        alreadyStartedGame = true;
-        OnLobbyStartGame?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
+        // Deprecated — client relay joining is now handled directly in HandleLobbyPolling
+        // via StartGameManager.Instance.JoinRelayAsync(). This method is kept as a stub
+        // to avoid breaking any external callers that may reference it.
+        Debug.LogWarning("[LobbyManager] JoinGame() is deprecated. Use JoinRelayAsync() instead.");
     }
 
     public async void SetRelayJoinCode(string relayJoinCode) {

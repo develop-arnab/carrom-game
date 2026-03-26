@@ -65,7 +65,7 @@ public class MainMenu : Panel
     private void PlayCarrom()
     {
         if (playCarromButton != null) playCarromButton.interactable = false;
-        LobbyManager.Instance.QuickJoinOrCreatePublicLobby();
+        LoadingSceneManager.Instance.LoadScene(SceneName.StartGameLobby, isNetworkSessionActive: false);
     }
 
     private void JoinByCode()

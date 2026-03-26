@@ -3,6 +3,14 @@ using UnityEngine;
 using TMPro;
 using Unity.Netcode;
 
+public struct BaselineData
+{
+    public bool  isHorizontal; // true = seats 0/2 (Y fixed), false = seats 1/3 (X fixed)
+    public float fixedAxis;    // the fixed coordinate value
+    public float rangeMin;     // slider min
+    public float rangeMax;     // slider max
+}
+
 /// <summary>
 /// Handles pocket triggers using the Graveyard pattern.
 /// Scoring is fully delegated to CarromGameManager via the Shot Ledger.
@@ -152,6 +160,50 @@ public class BoardScript : NetworkBehaviour
         }
 
         Destroy(ghost);
+    }
+
+    // -------------------------------------------------------------------------
+    // AI ACCESSORS
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Returns the four pocket world positions as hardcoded constants.
+    /// These match the physical corner pocket centers of the board prefab.
+    /// Using hardcoded values guarantees correctness regardless of how many
+    /// BoardScript instances exist in the scene or where they are placed.
+    /// </summary>
+    public static Vector2[] GetPocketPositions()
+    {
+        return new Vector2[]
+        {
+            new Vector2(-4.37f,  4.37f),  // Top-Left
+            new Vector2( 4.37f,  4.37f),  // Top-Right
+            new Vector2(-4.37f, -4.37f),  // Bottom-Left
+            new Vector2( 4.37f, -4.37f),  // Bottom-Right
+        };
+    }
+
+    /// <summary>
+    /// Returns the baseline parameters for the given seat index.
+    /// Seats 0 (South) and 2 (North) use a horizontal baseline (Y fixed, X slides).
+    /// Seats 1 (East) and 3 (West) use a vertical baseline (X fixed, Y slides).
+    /// Constants mirror those in StrikerController.ResetToBaseline.
+    /// </summary>
+    public static BaselineData GetBaseline(int seatIndex)
+    {
+        switch (seatIndex)
+        {
+            case 0: // South — horizontal, Y = -4.57f
+                return new BaselineData { isHorizontal = true,  fixedAxis = -4.57f, rangeMin = -3f, rangeMax = 3f };
+            case 1: // East  — vertical, X = 4.57f
+                return new BaselineData { isHorizontal = false, fixedAxis =  4.57f, rangeMin = -3f, rangeMax = 3f };
+            case 2: // North — horizontal, Y = 3.45f
+                return new BaselineData { isHorizontal = true,  fixedAxis =  3.45f, rangeMin = -3f, rangeMax = 3f };
+            case 3: // West  — vertical, X = -4.57f
+                return new BaselineData { isHorizontal = false, fixedAxis = -4.57f, rangeMin = -3f, rangeMax = 3f };
+            default: // fallback to seat 0
+                return new BaselineData { isHorizontal = true,  fixedAxis = -4.57f, rangeMin = -3f, rangeMax = 3f };
+        }
     }
 
     // -------------------------------------------------------------------------

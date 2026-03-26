@@ -58,52 +58,23 @@ public class StrikerController : NetworkBehaviour
 
     /// <summary>
     /// NGO ownership callback — fires on the NEW owner the moment authority transfers.
-    /// This is the canonical trigger for a turn reset in the single-striker architecture.
+    /// Position and state reset is handled exclusively by ResetToBaselineClientRpc and
+    /// TriggerBotShot, so this callback is intentionally left as a no-op.
     /// </summary>
     public override void OnGainedOwnership()
     {
         base.OnGainedOwnership();
-        Debug.Log("[StrikerController] Ownership gained — resetting to baseline");
-        ResetToBaseline();
+        Debug.Log("[StrikerController] Ownership gained");
     }
 
     /// <summary>
-    /// NGO ownership callback — fires on the OLD owner (now spectator) the moment
-    /// authority leaves. Snaps the striker to the opponent's baseline immediately,
-    /// bypassing the SyncAimClientRpc race condition entirely.
+    /// NGO ownership callback — fires on the OLD owner when authority leaves.
+    /// No position snapping here — ResetToBaselineClientRpc handles the incoming player's reset.
     /// </summary>
     public override void OnLostOwnership()
     {
         base.OnLostOwnership();
-        Debug.Log("[StrikerController] Ownership lost — snapping to opponent baseline");
-
-        // Wipe any residual physics / UI state
-        isMoving   = false;
-        isCharging = false;
-        isDragging = false;
-        if (rb != null)
-        {
-            rb.linearVelocity  = Vector2.zero;
-            rb.angularVelocity = 0f;
-        }
-
-        // Hide force field
-        if (strikerForceField != null)
-        {
-            strikerForceField.gameObject.SetActive(false);
-            strikerForceField.localScale = Vector3.zero;
-        }
-
-        // Ensure sprite is visible
-        SpriteRenderer sr = GetComponent<SpriteRenderer>();
-        if (sr != null) sr.enabled = true;
-
-        // Snap to the NEW owner's baseline (opponent's side)
-        // Host lost ownership → new owner is Client → Client sits at top (3.45f)
-        // Client lost ownership → new owner is Server → Server sits at bottom (-4.57f)
-        float opponentY = IsServer ? 3.45f : -4.57f;
-        float sliderX   = strikerSlider != null ? strikerSlider.value : 0f;
-        transform.position = new Vector3(sliderX, opponentY, 0f);
+        Debug.Log("[StrikerController] Ownership lost");
     }
 
     // -------------------------------------------------------------------------
@@ -123,10 +94,44 @@ public class StrikerController : NetworkBehaviour
     }
 
     /// <summary>
-    /// Wipes physics state, snaps the striker to the new owner's Y-baseline,
-    /// and broadcasts the position so the spectator sees it immediately.
+    /// Fired by the server after advancing to a human seat.
+    /// Only executes on the client whose LocalClientId matches the new active seat's OwnerClientId.
     /// </summary>
-    public void ResetToBaseline()
+    [ClientRpc]
+    public void ResetToBaselineClientRpc(int seatIndex)
+    {
+        CarromGameManager gm = CarromGameManager.Instance != null
+            ? CarromGameManager.Instance
+            : FindObjectOfType<CarromGameManager>();
+        if (gm == null)
+        {
+            Debug.LogError("[SC:TELEM] ResetToBaselineClientRpc: CarromGameManager not found!");
+            return;
+        }
+
+        ulong activeOwner = gm.GetSeatOwnerClientId(seatIndex);
+        ulong localId     = NetworkManager.Singleton.LocalClientId;
+        Debug.Log($"[SC:TELEM] ResetToBaselineClientRpc — seatIndex={seatIndex}, activeOwner={activeOwner}, localId={localId}, match={localId == activeOwner}");
+
+        if (localId != activeOwner)
+        {
+            Debug.Log($"[SC:TELEM] Ownership check FAILED — skipping reset (not our turn)");
+            return;
+        }
+
+        Debug.Log($"[SC:TELEM] Ownership check PASSED — calling ResetToBaseline({seatIndex})");
+        ResetToBaseline(seatIndex);
+    }
+
+    // East/West rail X positions for seats 1 and 3
+    [SerializeField] float eastRailX =  4.57f;
+    [SerializeField] float westRailX = -4.57f;
+
+    /// <summary>
+    /// Seat-aware baseline reset. Seat 0 (South) and 2 (North) use Y-axis positioning;
+    /// Seat 1 (East) and 3 (West) use X-axis positioning.
+    /// </summary>
+    public void ResetToBaseline(int seatIndex)
     {
         // Wipe physics residuals
         isMoving   = false;
@@ -138,32 +143,53 @@ public class StrikerController : NetworkBehaviour
             rb.angularVelocity = 0f;
         }
 
-        // Hide force field
         if (strikerForceField != null)
             strikerForceField.localScale = Vector3.zero;
 
-        // Ensure striker sprite is always visible on reset
         SpriteRenderer sr = GetComponent<SpriteRenderer>();
         if (sr != null) sr.enabled = true;
 
+        float sliderVal = strikerSlider != null ? strikerSlider.value : 0f;
+
+        switch (seatIndex)
+        {
+            case 0: SetPosition(sliderVal,  -4.57f); break;  // South — X-axis movement
+            case 1: SetPosition(eastRailX,  sliderVal); break; // East  — Y-axis movement
+            case 2: SetPosition(sliderVal,   3.45f); break;  // North — X-axis movement
+            case 3: SetPosition(westRailX,  sliderVal); break; // West  — Y-axis movement
+            default: SetPosition(sliderVal, -4.57f); break;
+        }
+
+        // Broadcast starting position
+        if (IsSpawned)
+        {
+            if (IsServer) SyncAimClientRpc(transform.position.x, transform.position.y);
+            else          RequestAimServerRpc(transform.position.x, transform.position.y);
+        }
+    }
+
+    /// <summary>Parameterless overload — resolves seat from CarromGameManager.activeSeatIndex.</summary>
+    public void ResetToBaseline()
+    {
         if (!IsSpawned)
         {
-            // Single-player: always bottom
+            // Single-player: always seat 0 (South)
+            isMoving = isCharging = isDragging = false;
+            if (rb != null) { rb.linearVelocity = Vector2.zero; rb.angularVelocity = 0f; }
+            if (strikerForceField != null) strikerForceField.localScale = Vector3.zero;
+            SpriteRenderer sr = GetComponent<SpriteRenderer>();
+            if (sr != null) sr.enabled = true;
             float x = strikerSlider != null ? strikerSlider.value : 0f;
             SetPosition(x, -4.57f);
             return;
         }
 
-        if (!IsOwner) return; // Non-owners wait for SyncAimClientRpc to move them
+        CarromGameManager gm = CarromGameManager.Instance != null
+            ? CarromGameManager.Instance
+            : FindObjectOfType<CarromGameManager>();
 
-        // Host sits at the bottom, Client at the top
-        float y = IsServer ? -4.57f : 3.45f;
-        float sliderX = strikerSlider != null ? strikerSlider.value : 0f;
-        SetPosition(sliderX, y);
-
-        // Broadcast starting position so spectator sees the striker appear at the baseline
-        if (IsServer) SyncAimClientRpc(sliderX, y);
-        else          RequestAimServerRpc(sliderX, y);
+        int seatIdx = gm != null ? (int)gm.activeSeatIndex.Value : (IsServer ? 0 : 2);
+        ResetToBaseline(seatIdx);
     }
 
     /// <summary>Moves the striker and keeps the force-field orientation consistent.</summary>
@@ -191,7 +217,7 @@ public class StrikerController : NetworkBehaviour
 
     private void Update()
     {
-        if (!IsOwner && IsSpawned) return;
+        if (IsSpawned && NetworkManager.Singleton.LocalClientId != CarromGameManager.Instance.GetActiveSeatOwnerClientId()) return;
 
         // --- Determine raw screen position and phase from mouse OR touch ---
         bool pressed  = false;
@@ -304,53 +330,70 @@ public class StrikerController : NetworkBehaviour
         }
     }
 
-    private IEnumerator FireShot(Vector3 releaseWorldPos)
+    /// <summary>
+    /// Universal shot entry point — called by human input (via FireShot) and AI bots (via TriggerBotShot).
+    /// Guard: only executes when IsOwner OR IsServer (for bot shots).
+    /// </summary>
+    public void ExecuteShot(Vector2 direction, float forceMagnitude)
     {
-        if (!isCharging) { isMoving = false; yield break; }
+        if (!IsOwner && !IsServer) return;
 
-        strikerForceField.gameObject.SetActive(false);
-        isCharging = false;
+        if (strikerForceField != null)
+            strikerForceField.gameObject.SetActive(false);
 
-        if (IsSpawned)
-            SyncForceFieldServerRpc(false, Vector3.zero, Vector3.zero);
-        yield return new WaitForSeconds(0.1f);
+        CarromGameManager gm = CarromGameManager.Instance != null
+            ? CarromGameManager.Instance
+            : FindObjectOfType<CarromGameManager>();
+        if (gm != null) gm.OnShotStart();
 
-        Vector3 direction = transform.position - releaseWorldPos;
-        direction.z = 0f;
-        float dragPercentage = Mathf.Clamp01(direction.magnitude / maxDragDistance);
-        float forceMagnitude = dragPercentage * maxForceMagnitude;
+        rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
 
-        if (IsSpawned)
-        {
-            CarromGameManager gm = FindObjectOfType<CarromGameManager>();
-            if (gm != null) gm.OnShotStart();
-            rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
-        }
-        else
-        {
-            rb.AddForce(direction.normalized * forceMagnitude, ForceMode2D.Impulse);
-        }
+        StartCoroutine(WaitForShotComplete());
+    }
 
+    /// <summary>
+    /// Post-shot wait coroutine — waits for all objects to stop, then calls OnShotComplete.
+    /// Extracted from FireShot so ExecuteShot can reuse it identically.
+    /// </summary>
+    private IEnumerator WaitForShotComplete()
+    {
         yield return new WaitForSeconds(0.1f);
         yield return new WaitUntil(() => rb.linearVelocity.magnitude < 0.1f);
 
-        CarromGameManager gm2 = FindObjectOfType<CarromGameManager>();
-        if (gm2 != null)
-            yield return new WaitUntil(() => gm2.AreAllObjectsStopped());
+        CarromGameManager gm = CarromGameManager.Instance != null
+            ? CarromGameManager.Instance
+            : FindObjectOfType<CarromGameManager>();
+        if (gm != null)
+            yield return new WaitUntil(() => gm.AreAllObjectsStopped());
 
         isMoving = false;
 
         if (IsSpawned)
         {
-            if (gm2 != null) gm2.OnShotComplete();
+            if (gm != null) gm.OnShotComplete();
         }
         else
         {
             playerTurn = false;
-        }
-
-        if (!IsSpawned)
             gameObject.SetActive(false);
+        }
+    }
+
+    private IEnumerator FireShot(Vector3 releaseWorldPos)
+    {
+        if (!isCharging) { isMoving = false; yield break; }
+
+        isCharging = false;
+        if (IsSpawned)
+            SyncForceFieldServerRpc(false, Vector3.zero, Vector3.zero);
+        yield return new WaitForSeconds(0.1f);
+
+        Vector3 dir3 = transform.position - releaseWorldPos;
+        dir3.z = 0f;
+        float dragPercentage = Mathf.Clamp01(dir3.magnitude / maxDragDistance);
+        float forceMagnitude = dragPercentage * maxForceMagnitude;
+
+        ExecuteShot(new Vector2(dir3.x, dir3.y), forceMagnitude);
     }
 
     // -------------------------------------------------------------------------
@@ -359,20 +402,31 @@ public class StrikerController : NetworkBehaviour
 
     public void SetSliderX()
     {
-        if (!IsOwner && IsSpawned) return;
+        if (IsSpawned && NetworkManager.Singleton.LocalClientId != CarromGameManager.Instance.GetActiveSeatOwnerClientId()) return;
         if (strikerSlider == null) return;
+        if (rb.linearVelocity.magnitude >= 0.1f) return;
 
-        if (rb.linearVelocity.magnitude < 0.1f)
+        CarromGameManager gm = CarromGameManager.Instance != null
+            ? CarromGameManager.Instance
+            : FindObjectOfType<CarromGameManager>();
+        int seatIdx = gm != null ? gm.activeSeatIndex.Value : (IsServer ? 0 : 2);
+
+        float val = strikerSlider.value;
+        float x = transform.position.x;
+        float y = transform.position.y;
+
+        // Seats 0/2 move along X; seats 1/3 move along Y
+        if (seatIdx == 1 || seatIdx == 3)
+            y = val;
+        else
+            x = val;
+
+        transform.position = new Vector3(x, y, 0);
+
+        if (IsSpawned)
         {
-            float y = (!IsSpawned || IsServer) ? -4.57f : 3.45f;
-            float x = strikerSlider.value;
-            transform.position = new Vector3(x, y, 0);
-
-            if (IsSpawned)
-            {
-                if (IsServer) SyncAimClientRpc(x, y);
-                else          RequestAimServerRpc(x, y);
-            }
+            if (IsServer) SyncAimClientRpc(x, y);
+            else          RequestAimServerRpc(x, y);
         }
     }
 
@@ -393,6 +447,36 @@ public class StrikerController : NetworkBehaviour
     {
         if (IsOwner) return;
         transform.position = new Vector3(x, y, 0);
+    }
+
+    /// <summary>
+    /// Server-only: broadcasts the striker's current position to all clients.
+    /// Called by CarromAIBrain at the start and end of the striker slide animation.
+    /// </summary>
+    public void BroadcastPositionToClients()
+    {
+        if (!IsServer) return;
+        SyncAimClientRpc(transform.position.x, transform.position.y);
+    }
+
+    /// <summary>
+    /// Server-only: drives the force-field aiming arrow for bot shots.
+    /// Mirrors the visual state the human drag code produces so remote clients
+    /// see the bot "charging up" before it fires.
+    /// lookTarget — world-space point the arrow should point toward
+    /// scale       — uniform scale applied to strikerForceField (ramp from 0 → max)
+    /// </summary>
+    public void SimulateAimingVisuals(Vector3 lookTarget, Vector3 scale)
+    {
+        if (!IsServer) return;
+        if (strikerForceField == null) return;
+
+        strikerForceField.gameObject.SetActive(true);
+        strikerForceField.LookAt(lookTarget);
+        strikerForceField.localScale = scale;
+
+        // Broadcast to all clients so they see the animated arrow
+        SyncForceFieldClientRpc(true, lookTarget, scale);
     }
 
     [ServerRpc(RequireOwnership = false)]

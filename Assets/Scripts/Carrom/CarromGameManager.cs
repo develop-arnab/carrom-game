@@ -20,13 +20,75 @@ public enum CoinType { White, Black, Queen, Striker }
 /// </summary>
 public enum GameMode { Freestyle, Classic }
 
+/// <summary>
+/// Identifies how a seat is controlled in a 4-seat match.
+/// </summary>
+public enum ControllerType { Human_Local, Human_Network, AI_Bot, Closed }
+
+/// <summary>
+/// Team assignment for a seat — White or Black.
+/// </summary>
+public enum Team { White, Black }
+
+/// <summary>
+/// Represents a single seat in the 4-seat roster, serializable over the network.
+/// </summary>
+public struct SeatData : INetworkSerializable
+{
+    public byte           SeatIndex;
+    public ControllerType ControllerType;
+    public Team           Team;
+    public ulong          OwnerClientId;
+
+    public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
+    {
+        serializer.SerializeValue(ref SeatIndex);
+        serializer.SerializeValue(ref ControllerType);
+        serializer.SerializeValue(ref Team);
+        serializer.SerializeValue(ref OwnerClientId);
+    }
+}
+
+/// <summary>
+/// Holds the full 4-seat roster in a single NGO-serializable struct.
+/// Named fields are required because BufferSerializer does not support array serialization directly.
+/// </summary>
+public struct RosterState : INetworkSerializable
+{
+    public SeatData Seat0, Seat1, Seat2, Seat3;
+
+    public SeatData this[int i] => i switch { 0 => Seat0, 1 => Seat1, 2 => Seat2, _ => Seat3 };
+
+    public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
+    {
+        serializer.SerializeValue(ref Seat0);
+        serializer.SerializeValue(ref Seat1);
+        serializer.SerializeValue(ref Seat2);
+        serializer.SerializeValue(ref Seat3);
+    }
+}
+
 public class CarromGameManager : NetworkBehaviour
 {
+    public static CarromGameManager Instance { get; private set; }
+
     /// <summary>
     /// Static carrier — set by CharacterSelectionManager before scene load,
     /// read by Start() to configure the match rules.
     /// </summary>
-    public static GameMode ActiveRuleset = GameMode.Freestyle;
+    public static GameMode ActiveRuleset    = GameMode.Freestyle;
+
+    /// <summary>
+    /// Set by StartGameLobbyManager.InjectGhostBots() before scene load.
+    /// Total seats (human + bot) for this match.
+    /// </summary>
+    public static int PendingPlayerCount = 2;
+
+    /// <summary>
+    /// Set by StartGameLobbyManager.InjectGhostBots() before scene load.
+    /// Number of AI bot seats to fill.
+    /// </summary>
+    public static int PendingBotCount = 0;
     public NetworkVariable<int>   networkScorePlayer      = new NetworkVariable<int>(0,     NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     public NetworkVariable<int>   networkScoreEnemy       = new NetworkVariable<int>(0,     NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     public NetworkVariable<float> networkTimeLeft         = new NetworkVariable<float>(120f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
@@ -36,6 +98,20 @@ public class CarromGameManager : NetworkBehaviour
     public NetworkVariable<bool>  clientSecuredQueen      = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     public NetworkVariable<FixedString64Bytes> networkHostName   = new NetworkVariable<FixedString64Bytes>("",          NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     public NetworkVariable<FixedString64Bytes> networkClientName = new NetworkVariable<FixedString64Bytes>("Waiting...", NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<RosterState> rosterState = new NetworkVariable<RosterState>(
+        default,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server);
+    public NetworkVariable<int> activeSeatIndex = new NetworkVariable<int>(
+        0,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server);
+    private NetworkVariable<int> score0 = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<int> score1 = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<int> score2 = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<int> score3 = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    private SeatData[] Roster = new SeatData[4];
 
     bool gameOver = false;
     bool isPaused = false;
@@ -71,6 +147,9 @@ public class CarromGameManager : NetworkBehaviour
     [Tooltip("Minimum velocity magnitude for a piece to be considered moving")]
     private float velocityThreshold = 0.1f;
 
+    [Header("AI")]
+    [SerializeField] CarromAIBrain aiBrain;
+
     TimerScript timerScript;
     private const string FirstTimeLaunchKey = "FirstTimeLaunch";
 
@@ -80,6 +159,7 @@ public class CarromGameManager : NetworkBehaviour
 
     void Awake()
     {
+        Instance = this;
         timerScript = GetComponent<TimerScript>();
         if (PlayerPrefs.GetInt(FirstTimeLaunchKey, 0) == 0)
         {
@@ -100,16 +180,14 @@ public class CarromGameManager : NetworkBehaviour
         Time.timeScale = 1;
         if (IsServer)
         {
-            currentGameMode               = ActiveRuleset; // read static handoff from CharacterSelection
-            networkScoreEnemy.Value       = 0;
-            networkScorePlayer.Value      = 0;
-            networkTimeLeft.Value         = 120f;
-            networkPlayerTurn.Value       = true;
-            networkCoinsRemaining.Value   = 19;
-            hostSecuredQueen.Value        = false;
-            clientSecuredQueen.Value      = false;
+            currentGameMode             = ActiveRuleset;
+            networkTimeLeft.Value       = 120f;
+            networkPlayerTurn.Value     = true;
+            networkCoinsRemaining.Value = 19;
+            hostSecuredQueen.Value      = false;
+            clientSecuredQueen.Value    = false;
+            score0.Value = score1.Value = score2.Value = score3.Value = 0;
 
-            // Classic still uses a threshold; Freestyle uses coin depletion instead
             winScoreThreshold = currentGameMode == GameMode.Classic ? 9 : int.MaxValue;
             Debug.Log($"[CarromGameManager] Mode={currentGameMode}, winThreshold={winScoreThreshold}");
         }
@@ -134,6 +212,7 @@ public class CarromGameManager : NetworkBehaviour
                 sliderComponent.direction = UnityEngine.UI.Slider.Direction.LeftToRight;
 
             StartCoroutine(SendInitialBoardStateDelayed());
+            PopulateRoster();
         }
         else
         {
@@ -144,6 +223,9 @@ public class CarromGameManager : NetworkBehaviour
                 sliderComponent.direction = UnityEngine.UI.Slider.Direction.RightToLeft;
         }
 
+        // Subscribe to activeSeatIndex changes to update UI on all clients
+        activeSeatIndex.OnValueChanged += OnActiveSeatIndexChanged;
+
         // ---- Identity Handshake ----
         string localName = AuthenticationService.Instance.PlayerName
                         ?? AuthenticationService.Instance.PlayerId
@@ -152,11 +234,29 @@ public class CarromGameManager : NetworkBehaviour
         if (IsServer)
         {
             networkHostName.Value = new FixedString64Bytes(localName);
+            // Fix 1: In a solo bot game no human client connects, so SubmitClientNameServerRpc
+            // is never called. Set the opponent name here so the UI doesn't stay on "Waiting...".
+            if (PendingBotCount > 0)
+                networkClientName.Value = new FixedString64Bytes("AI Bot");
         }
         else
         {
             SubmitClientNameServerRpc(localName);
         }
+    }
+
+    public override void OnNetworkDespawn()
+    {
+        activeSeatIndex.OnValueChanged -= OnActiveSeatIndexChanged;
+        base.OnNetworkDespawn();
+    }
+
+    private void OnActiveSeatIndexChanged(int previousValue, int newValue)
+    {
+        bool isMyTurn = NetworkManager.Singleton.LocalClientId == GetActiveSeatOwnerClientId();
+        if (slider   != null) slider.SetActive(isMyTurn);
+        if (turnText != null) turnText.SetActive(isMyTurn);
+        Debug.Log($"[CarromGameManager] activeSeatIndex changed {previousValue}→{newValue}, isMyTurn={isMyTurn}");
     }
 
     [ServerRpc(RequireOwnership = false)]
@@ -183,22 +283,26 @@ public class CarromGameManager : NetworkBehaviour
 
     void Update()
     {
-        bool isPlayerTurnActive = IsSpawned
-            ? (IsHost ? networkPlayerTurn.Value : !networkPlayerTurn.Value)
+        // Seat-aware turn indicator: active when local client owns the current seat
+        bool isMyTurn = IsSpawned
+            ? NetworkManager.Singleton.LocalClientId == GetActiveSeatOwnerClientId()
             : StrikerController.playerTurn;
 
-        if (slider   != null) slider.SetActive(isPlayerTurnActive);
-        if (turnText != null) turnText.SetActive(isPlayerTurnActive);
+        if (slider   != null) slider.SetActive(isMyTurn);
+        if (turnText != null) turnText.SetActive(isMyTurn);
 
-        int   currentScoreEnemy  = networkScoreEnemy.Value;
-        int   currentScorePlayer = networkScorePlayer.Value;
-        float currentTimeLeft    = IsSpawned ? networkTimeLeft.Value : timerScript.timeLeft;
+        // Aggregate team scores for win-condition evaluation
+        int whiteTeamScore = score0.Value + score2.Value;
+        int blackTeamScore = score1.Value + score3.Value;
+        float currentTimeLeft = IsSpawned ? networkTimeLeft.Value : timerScript.timeLeft;
 
         // GUARD: Only check win conditions if the game is actually running
         if (!gameOver)
         {
             bool boardCleared = currentGameMode == GameMode.Freestyle && networkCoinsRemaining.Value <= 0;
-            if (boardCleared || (currentGameMode == GameMode.Classic && (currentScoreEnemy >= winScoreThreshold || currentScorePlayer >= winScoreThreshold)) || currentTimeLeft <= 0)
+            bool classicWin   = currentGameMode == GameMode.Classic &&
+                                (whiteTeamScore >= winScoreThreshold || blackTeamScore >= winScoreThreshold);
+            if (boardCleared || classicWin || currentTimeLeft <= 0)
                 if (!IsSpawned || IsServer) onGameOver();
         }
 
@@ -211,8 +315,25 @@ public class CarromGameManager : NetworkBehaviour
     private void LateUpdate()
     {
         if (gameOver) return;
-        scoreTextEnemy.text  = networkScoreEnemy.Value.ToString();
-        scoreTextPlayer.text = networkScorePlayer.Value.ToString();
+
+        // Dynamically aggregate scores by Team assignment so Freestyle mode
+        // correctly attributes points regardless of which seat index holds which team.
+        // score0–score3 map 1-to-1 with seat indices 0–3.
+        int[] seatScores = { score0.Value, score1.Value, score2.Value, score3.Value };
+        RosterState rs   = rosterState.Value;
+
+        int whiteTotal = 0;
+        int blackTotal = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            SeatData seat = rs[i];
+            if (seat.ControllerType == ControllerType.Closed) continue;
+            if (seat.Team == Team.White) whiteTotal += seatScores[i];
+            else                         blackTotal += seatScores[i];
+        }
+
+        scoreTextPlayer.text = whiteTotal.ToString();
+        scoreTextEnemy.text  = blackTotal.ToString();
         if (hostNameText   != null) hostNameText.text   = GetCleanPlayerName(networkHostName.Value.ToString());
         if (clientNameText != null) clientNameText.text = GetCleanPlayerName(networkClientName.Value.ToString());
     }
@@ -227,17 +348,17 @@ public class CarromGameManager : NetworkBehaviour
     {
         if (IsSpawned && !IsServer) return;
 
-        gameOver = true; // Ensure the Server locally knows the game is over immediately
+        gameOver = true;
 
-        int hostScore   = networkScorePlayer.Value;
-        int clientScore = networkScoreEnemy.Value;
+        int whiteScore = score0.Value + score2.Value;
+        int blackScore = score1.Value + score3.Value;
 
         GameResult result;
-        if      (hostScore > clientScore)       result = GameResult.HostWins;
-        else if (clientScore > hostScore)       result = GameResult.ClientWins;
-        else if (hostSecuredQueen.Value)        result = GameResult.HostWins;   // tiebreaker
-        else if (clientSecuredQueen.Value)      result = GameResult.ClientWins; // tiebreaker
-        else                                    result = GameResult.Draw;       // time-out, no queen
+        if      (whiteScore > blackScore)       result = GameResult.HostWins;
+        else if (blackScore > whiteScore)       result = GameResult.ClientWins;
+        else if (hostSecuredQueen.Value)        result = GameResult.HostWins;
+        else if (clientSecuredQueen.Value)      result = GameResult.ClientWins;
+        else                                    result = GameResult.Draw;
 
         if (IsSpawned)
         {
@@ -248,8 +369,8 @@ public class CarromGameManager : NetworkBehaviour
             gameOver = true;
             gameOverMenu.SetActive(true);
             Time.timeScale = 0;
-            gameOverText.text = networkScoreEnemy.Value > networkScorePlayer.Value ? "You Lose!"
-                              : networkScoreEnemy.Value < networkScorePlayer.Value ? "You Win!"
+            gameOverText.text = blackScore > whiteScore ? "You Lose!"
+                              : blackScore < whiteScore ? "You Win!"
                               : "Draw!";
         }
     }
@@ -362,6 +483,16 @@ public class CarromGameManager : NetworkBehaviour
 
         telemetryRecorder?.StopRecording();
 
+        // Fix 2: In a solo bot game there are no remote clients, so batchTransmitter has
+        // nobody to send a replay to and PlaybackEngine will never call TriggerAuthorityTransfer.
+        // Bypass the transmitter entirely and advance the turn directly on the server.
+        if (IsServer && NetworkManager.Singleton.ConnectedClientsIds.Count <= 1)
+        {
+            Debug.Log("[CarromGameManager] Solo bot game — skipping replay transmit, calling TriggerAuthorityTransfer directly");
+            TriggerAuthorityTransfer();
+            return;
+        }
+
         EndStatePayload endState = ConstructEndState();
         batchTransmitter?.TransmitFullReplay(endState);
     }
@@ -371,6 +502,137 @@ public class CarromGameManager : NetworkBehaviour
     // -------------------------------------------------------------------------
 
     /// <summary>
+    /// Populates the 4-seat Roster using PendingPlayerCount and PendingBotCount.
+    /// SeatPriority [0,2,1,3] determines fill order.
+    /// Writes the completed roster into rosterState so all clients receive it via NGO sync.
+    /// Server-only.
+    /// </summary>
+    private void PopulateRoster()
+    {
+        if (!IsServer) return;
+
+        // Validate PendingPlayerCount
+        if (PendingPlayerCount < 1 || PendingPlayerCount > 4)
+        {
+            Debug.LogError($"[CarromGameManager] PopulateRoster: invalid PendingPlayerCount={PendingPlayerCount}, defaulting to 2-seat human layout");
+            PendingPlayerCount = 2;
+            PendingBotCount    = 0;
+        }
+
+        int[] seatPriority  = { 0, 2, 1, 3 };
+        int   humanCount    = PendingPlayerCount - PendingBotCount;
+        var   connectedIds  = NetworkManager.Singleton.ConnectedClientsIds;
+        int   clientIdx     = 0;
+
+        // Reset all seats to Closed first
+        for (int i = 0; i < 4; i++)
+            Roster[i] = new SeatData { SeatIndex = (byte)i, ControllerType = ControllerType.Closed, Team = Team.White, OwnerClientId = 0 };
+
+        // Assign human seats
+        for (int p = 0; p < humanCount && p < seatPriority.Length; p++)
+        {
+            int seatIdx = seatPriority[p];
+            ulong clientId = clientIdx < connectedIds.Count ? connectedIds[clientIdx] : 0;
+            bool  isHost   = clientId == NetworkManager.Singleton.LocalClientId;
+            Roster[seatIdx] = new SeatData
+            {
+                SeatIndex      = (byte)seatIdx,
+                ControllerType = isHost ? ControllerType.Human_Local : ControllerType.Human_Network,
+                Team           = Team.White, // placeholder, set below
+                OwnerClientId  = clientId
+            };
+            clientIdx++;
+        }
+
+        // Assign bot seats
+        for (int b = 0; b < PendingBotCount; b++)
+        {
+            int prioritySlot = humanCount + b;
+            if (prioritySlot >= seatPriority.Length) break;
+            int seatIdx = seatPriority[prioritySlot];
+            Roster[seatIdx] = new SeatData
+            {
+                SeatIndex      = (byte)seatIdx,
+                ControllerType = ControllerType.AI_Bot,
+                Team           = Team.White, // placeholder, set below
+                OwnerClientId  = 0
+            };
+        }
+
+        // Team assignment
+        if (PendingPlayerCount == 2)
+        {
+            Roster[0].Team = Team.White;
+            Roster[2].Team = Team.Black;
+        }
+        else // >= 3
+        {
+            Roster[0].Team = Team.White;
+            Roster[1].Team = Team.Black;
+            Roster[2].Team = Team.White;
+            Roster[3].Team = Team.Black;
+        }
+
+        // Write to NetworkVariable
+        rosterState.Value = new RosterState
+        {
+            Seat0 = Roster[0],
+            Seat1 = Roster[1],
+            Seat2 = Roster[2],
+            Seat3 = Roster[3]
+        };
+
+        Debug.Log($"[CarromGameManager] PopulateRoster complete — {PendingPlayerCount} seats, {PendingBotCount} bots");
+    }
+
+    /// <summary>
+    /// Advances activeSeatIndex clockwise by 1, skipping Closed seats.
+    /// Server-only. Guards against all-closed infinite loop.
+    /// </summary>
+    private void AdvanceTurn()
+    {
+        if (!IsServer) return;
+
+        int next       = (activeSeatIndex.Value + 1) % 4;
+        int iterations = 0;
+        while (Roster[next].ControllerType == ControllerType.Closed)
+        {
+            next = (next + 1) % 4;
+            iterations++;
+            if (iterations >= 4)
+            {
+                Debug.LogError("[CarromGameManager] AdvanceTurn: all seats are Closed — cannot advance");
+                return;
+            }
+        }
+
+        activeSeatIndex.Value = next;
+        SeatData newSeat = Roster[next];
+        UpdateTurnDisplayClientRpc(newSeat.Team, newSeat.ControllerType);
+        Debug.Log($"[CarromGameManager] AdvanceTurn → seat {next} ({newSeat.ControllerType}, {newSeat.Team})");
+    }
+
+    /// <summary>
+    /// Retains the current seat's turn — resets the striker without changing ownership.
+    /// Server-only.
+    /// </summary>
+    private void RetainCurrentSeat()
+    {
+        if (!IsServer) return;
+
+        StrikerController striker = activeStriker != null
+            ? activeStriker.GetComponent<StrikerController>()
+            : null;
+
+        if (striker != null)
+            striker.RetainTurnResetClientRpc();
+        else
+            Debug.LogWarning("[CarromGameManager] RetainCurrentSeat: could not find StrikerController");
+
+        Debug.Log("[CarromGameManager] RetainCurrentSeat — striker reset via RetainTurnResetClientRpc");
+    }
+
+    /// <summary>
     /// Flips networkPlayerTurn. Only callable on server.
     /// Called inside TransferAuthority so the flip happens at the very end of the cycle.
     /// </summary>
@@ -378,14 +640,13 @@ public class CarromGameManager : NetworkBehaviour
     {
         if (!IsServer) return;
         networkPlayerTurn.Value = !networkPlayerTurn.Value;
-        UpdateTurnDisplayClientRpc(networkPlayerTurn.Value);
         Debug.Log($"[CarromGameManager] Turn flipped — networkPlayerTurn={networkPlayerTurn.Value}");
     }
 
     [ClientRpc]
-    private void UpdateTurnDisplayClientRpc(bool isPlayerTurn)
+    private void UpdateTurnDisplayClientRpc(Team team, ControllerType ct)
     {
-        Debug.Log($"[CarromGameManager] Turn display updated — {isPlayerTurn}");
+        Debug.Log($"[CarromGameManager] Turn display updated — team={team}, controller={ct}");
     }
 
     public GameObject GetActiveStriker() => activeStriker;
@@ -394,17 +655,32 @@ public class CarromGameManager : NetworkBehaviour
     /// Returns the client ID of the player whose turn it currently is.
     /// Reads networkPlayerTurn which reflects the CURRENT (not next) turn.
     /// </summary>
-    public ulong GetActivePlayerClientId()
+    public ulong GetActivePlayerClientId() => GetActiveSeatOwnerClientId();
+
+    /// <summary>
+    /// Server-only: triggers an AI bot shot for the given seat.
+    /// Resets striker to the bot's baseline, then fires toward board center with a fixed force.
+    /// </summary>
+    private void TriggerBotShot(SeatData botSeat)
     {
-        if (!IsSpawned) return ulong.MaxValue;
-        // GetCurrentActivePlayerId requires IsServer — call via server path only
-        if (IsServer) return GetCurrentActivePlayerId();
-        // On client, derive from networkPlayerTurn
-        bool myTurn = !networkPlayerTurn.Value; // client's turn when networkPlayerTurn=false
-        return myTurn ? NetworkManager.Singleton.LocalClientId : ulong.MaxValue;
+        if (!IsServer) return;
+        if (aiBrain == null) { Debug.LogError("[CarromGameManager] aiBrain is not assigned!"); return; }
+        aiBrain.TriggerBotShot(botSeat);
     }
 
-    public void TriggerAuthorityTransfer() => TransferAuthority();
+    public void TriggerAuthorityTransfer()
+    {
+        Debug.Log($"[CGM:TELEM] TriggerAuthorityTransfer called — IsServer={IsServer}, IsSpawned={IsSpawned}, LocalClientId={NetworkManager.Singleton?.LocalClientId}");
+        if (IsServer) TransferAuthority();
+        else          TriggerAuthorityTransferServerRpc();
+    }
+
+    [ServerRpc(RequireOwnership = false)]
+    private void TriggerAuthorityTransferServerRpc()
+    {
+        Debug.Log("[CGM:TELEM] TriggerAuthorityTransferServerRpc received on server — calling TransferAuthority()");
+        TransferAuthority();
+    }
 
     // -------------------------------------------------------------------------
     // SHOT LEDGER — server-authoritative, cleared after every TransferAuthority
@@ -444,132 +720,153 @@ public class CarromGameManager : NetworkBehaviour
     /// Enforces: Striker foul economy, Queen Last rule.
     /// </summary>
     private bool EvaluateFreestyleMode()
-    {
-        bool isHostTurn  = networkPlayerTurn.Value;
-        int  points      = 0;
-        bool retainTurn  = false;
-        bool queenSecured = hostSecuredQueen.Value || clientSecuredQueen.Value;
-        bool queenPocketedThisShot = shotLedger.Contains(CoinType.Queen);
-
-        foreach (CoinType coin in shotLedger)
         {
-            if (coin == CoinType.White || coin == CoinType.Black)
-            {
-                // --- Queen Last Rule ---
-                // If this was the last coin of its color on the board AND the Queen
-                // hasn't been secured AND the Queen wasn't pocketed this same shot,
-                // the shot is illegal — return the coin and deny turn retention.
-                if (GetBoardCoinCount(coin) == 0 && !queenSecured && !queenPocketedThisShot && !isQueenPending)
-                {
-                    byte illegalId = GetGraveyardCoinId(coin);
-                    if (illegalId != 255) RespawnPiece(illegalId);
-                    Debug.Log($"[CGM] Freestyle: Queen Last rule triggered for {coin} — coin returned");
-                    continue; // no points, no retain for this coin
-                }
+            int  activeIdx   = activeSeatIndex.Value;
+            int  points      = 0;
+            bool retainTurn  = false;
+            bool queenSecured = hostSecuredQueen.Value || clientSecuredQueen.Value;
+            bool queenPocketedThisShot = shotLedger.Contains(CoinType.Queen);
 
-                points += coin == CoinType.White ? 20 : 10;
-                networkCoinsRemaining.Value -= 1;
-                retainTurn = true;
+            // Helper: get the active seat's current accumulated score
+            int GetActiveSeatScore() => activeIdx switch {
+                0 => score0.Value,
+                1 => score1.Value,
+                2 => score2.Value,
+                _ => score3.Value
+            };
+
+            // Helper: add points to the active seat's score NetworkVariable
+            void AddActiveSeatScore(int pts) {
+                switch (activeIdx) {
+                    case 0: score0.Value += pts; break;
+                    case 1: score1.Value += pts; break;
+                    case 2: score2.Value += pts; break;
+                    default: score3.Value += pts; break;
+                }
             }
-            else if (coin == CoinType.Striker)
+
+            foreach (CoinType coin in shotLedger)
             {
-                // --- Zero-Floor Policy ---
-                // Active player's running score = their NetworkVariable + points accumulated so far this shot.
-                int currentScore = (isHostTurn ? networkScorePlayer.Value : networkScoreEnemy.Value) + points;
-
-                if (currentScore <= 0)
+                if (coin == CoinType.White || coin == CoinType.Black)
                 {
-                    // Rule 1: Score is already at zero — waive the penalty entirely.
-                    // No deduction, no coin return. Turn is simply lost (retainTurn stays false).
-                    Debug.Log("[CGM] Freestyle: Striker foul — score at zero, penalty waived");
+                    // --- Queen Last Rule ---
+                    // If this was the last coin of its color on the board AND the Queen
+                    // hasn't been secured AND the Queen wasn't pocketed this same shot,
+                    // the shot is illegal — return the coin and deny turn retention.
+                    if (GetBoardCoinCount(coin) == 0 && !queenSecured && !queenPocketedThisShot && !isQueenPending)
+                    {
+                        byte illegalId = GetGraveyardCoinId(coin);
+                        if (illegalId != 255) RespawnPiece(illegalId);
+                        Debug.Log($"[CGM] Freestyle: Queen Last rule triggered for {coin} — coin returned");
+                        continue; // no points, no retain for this coin
+                    }
+
+                    points += coin == CoinType.White ? 20 : 10;
+                    networkCoinsRemaining.Value -= 1;
+                    retainTurn = true;
                 }
-                else
+                else if (coin == CoinType.Striker)
                 {
-                    // Rule 2: Minimum Denomination Return.
-                    // Return the lowest-value coin the player can logically own.
-                    // Priority: Black (10 pts) first, then White (20 pts).
-                    // Guard: only pull a White if the player's score is >= 20 (they couldn't own one otherwise).
-                    byte penaltyId   = 255;
-                    int  penaltyPts  = 0;
+                    // --- Zero-Floor Policy ---
+                    // Active player's running score = their NetworkVariable + points accumulated so far this shot.
+                    int currentScore = GetActiveSeatScore() + points;
 
-                    byte blackId = GetGraveyardCoinId(CoinType.Black);
-                    byte whiteId = GetGraveyardCoinId(CoinType.White);
-
-                    if (blackId != 255 && currentScore >= 10)
+                    if (currentScore <= 0)
                     {
-                        penaltyId  = blackId;
-                        penaltyPts = 10;
-                    }
-                    else if (whiteId != 255 && currentScore >= 20)
-                    {
-                        penaltyId  = whiteId;
-                        penaltyPts = 20;
-                    }
-
-                    if (penaltyId != 255)
-                    {
-                        points -= penaltyPts;
-                        RespawnPiece(penaltyId);
-                        networkCoinsRemaining.Value += 1;
-                        Debug.Log($"[CGM] Freestyle: Striker foul — piece {penaltyId} ({penaltyPts} pts) returned to board");
+                        // Rule 1: Score is already at zero — waive the penalty entirely.
+                        // No deduction, no coin return. Turn is simply lost (retainTurn stays false).
+                        Debug.Log("[CGM] Freestyle: Striker foul — score at zero, penalty waived");
                     }
                     else
                     {
-                        // No returnable coin found (graveyard empty) — deduct points only, floor at zero.
-                        int deduction = Mathf.Min(10, currentScore);
-                        points -= deduction;
-                        Debug.Log($"[CGM] Freestyle: Striker foul — no coin to return, deducted {deduction} pts");
+                        // Rule 2: Minimum Denomination Return.
+                        // Return the lowest-value coin the player can logically own.
+                        // Priority: Black (10 pts) first, then White (20 pts).
+                        // Guard: only pull a White if the player's score is >= 20 (they couldn't own one otherwise).
+                        byte penaltyId   = 255;
+                        int  penaltyPts  = 0;
+
+                        byte blackId = GetGraveyardCoinId(CoinType.Black);
+                        byte whiteId = GetGraveyardCoinId(CoinType.White);
+
+                        if (blackId != 255 && currentScore >= 10)
+                        {
+                            penaltyId  = blackId;
+                            penaltyPts = 10;
+                        }
+                        else if (whiteId != 255 && currentScore >= 20)
+                        {
+                            penaltyId  = whiteId;
+                            penaltyPts = 20;
+                        }
+
+                        if (penaltyId != 255)
+                        {
+                            points -= penaltyPts;
+                            RespawnPiece(penaltyId);
+                            networkCoinsRemaining.Value += 1;
+                            Debug.Log($"[CGM] Freestyle: Striker foul — piece {penaltyId} ({penaltyPts} pts) returned to board");
+                        }
+                        else
+                        {
+                            // No returnable coin found (graveyard empty) — deduct points only, floor at zero.
+                            int deduction = Mathf.Min(10, currentScore);
+                            points -= deduction;
+                            Debug.Log($"[CGM] Freestyle: Striker foul — no coin to return, deducted {deduction} pts");
+                        }
                     }
                 }
             }
-        }
 
-        // --- Queen state machine ---
-        bool hasCover = shotLedger.Contains(CoinType.White) || shotLedger.Contains(CoinType.Black);
+            // --- Queen state machine ---
+            bool hasCover = shotLedger.Contains(CoinType.White) || shotLedger.Contains(CoinType.Black);
 
-        if (isQueenPending)
-        {
-            if (hasCover)
+            if (isQueenPending)
             {
-                points += 50;
-                networkCoinsRemaining.Value -= 1;
-                if (isHostTurn) hostSecuredQueen.Value = true; else clientSecuredQueen.Value = true;
-                isQueenPending = false;
+                if (hasCover)
+                {
+                    points += 50;
+                    networkCoinsRemaining.Value -= 1;
+                    // TODO: replace with per-seat queen flag when 4-player queen tracking is implemented
+                    if (activeIdx == 0 || activeIdx == 2) hostSecuredQueen.Value = true;
+                    else clientSecuredQueen.Value = true;
+                    isQueenPending = false;
+                    retainTurn = true;
+                    Debug.Log("[CGM] Queen covered (follow-up) — +50");
+                }
+                else { isQueenPending = false; RespawnPiece(19); Debug.Log("[CGM] Queen cover failed — respawning"); }
+            }
+            else if (queenPocketedThisShot)
+            {
                 retainTurn = true;
-                Debug.Log("[CGM] Queen covered (follow-up) — +50");
+                if (hasCover)
+                {
+                    points += 50;
+                    networkCoinsRemaining.Value -= 1;
+                    // TODO: replace with per-seat queen flag when 4-player queen tracking is implemented
+                    if (activeIdx == 0 || activeIdx == 2) hostSecuredQueen.Value = true;
+                    else clientSecuredQueen.Value = true;
+                    Debug.Log("[CGM] Queen same-shot cover — +50");
+                }
+                else { isQueenPending = true; Debug.Log("[CGM] Queen pending cover next shot"); }
             }
-            else { isQueenPending = false; RespawnPiece(19); Debug.Log("[CGM] Queen cover failed — respawning"); }
-        }
-        else if (queenPocketedThisShot)
-        {
-            retainTurn = true;
-            if (hasCover)
+
+            if (points != 0)
             {
-                points += 50;
-                networkCoinsRemaining.Value -= 1;
-                if (isHostTurn) hostSecuredQueen.Value = true; else clientSecuredQueen.Value = true;
-                Debug.Log("[CGM] Queen same-shot cover — +50");
+                AddActiveSeatScore(points);
+                Debug.Log($"[CGM] Freestyle: {points} pts → seat {activeIdx} | coinsLeft={networkCoinsRemaining.Value}");
             }
-            else { isQueenPending = true; Debug.Log("[CGM] Queen pending cover next shot"); }
-        }
 
-        if (points != 0)
-        {
-            if (isHostTurn) networkScorePlayer.Value += points;
-            else            networkScoreEnemy.Value  += points;
-            Debug.Log($"[CGM] Freestyle: {points} pts → {(isHostTurn ? "Host" : "Client")} | coinsLeft={networkCoinsRemaining.Value}");
-        }
+            // --- Ultimate Foul Override (The Guillotine Clause) ---
+            // Regardless of score, penalties waived, or coins pocketed, a Striker foul forcibly ends the turn.
+            if (shotLedger.Contains(CoinType.Striker))
+            {
+                retainTurn = false;
+                Debug.Log("[CGM] Freestyle: Striker foul absolute override — turn forcibly lost");
+            }
 
-        // --- Ultimate Foul Override (The Guillotine Clause) ---
-        // Regardless of score, penalties waived, or coins pocketed, a Striker foul forcibly ends the turn.
-        if (shotLedger.Contains(CoinType.Striker))
-        {
-            retainTurn = false;
-            Debug.Log("[CGM] Freestyle: Striker foul absolute override — turn forcibly lost");
+            return retainTurn;
         }
-
-        return retainTurn;
-    }
 
     /// <summary>
     /// Classic: strict color assignment, absolute scoring, strict Queen cover.
@@ -579,52 +876,54 @@ public class CarromGameManager : NetworkBehaviour
     /// </summary>
     private bool EvaluateClassicMode()
     {
-        bool     isHostTurn = networkPlayerTurn.Value;
-        CoinType myCoin     = isHostTurn ? CoinType.White : CoinType.Black;
+        int      activeIdx = activeSeatIndex.Value;
+        CoinType myCoin    = Roster[activeIdx].Team == Team.White ? CoinType.White : CoinType.Black;
         bool     retainTurn = false;
         bool     queenSecured = hostSecuredQueen.Value || clientSecuredQueen.Value;
         bool     queenPocketedThisShot = shotLedger.Contains(CoinType.Queen);
+
+        // Helpers for per-seat score access
+        int GetSeatScore(int idx) => idx switch { 0 => score0.Value, 1 => score1.Value, 2 => score2.Value, _ => score3.Value };
+        void AddSeatScore(int idx, int pts) { switch (idx) { case 0: score0.Value += pts; break; case 1: score1.Value += pts; break; case 2: score2.Value += pts; break; default: score3.Value += pts; break; } }
+
+        // White team seats: 0 and 2 — Black team seats: 1 and 3
+        int WhiteTeamScore() => score0.Value + score2.Value;
+        int BlackTeamScore() => score1.Value + score3.Value;
 
         // --- Absolute scoring with Queen Last enforcement ---
         foreach (CoinType coin in shotLedger)
         {
             if (coin == CoinType.White || coin == CoinType.Black)
             {
-                // Queen Last Rule: illegal to clear ANY color's last coin before the Queen is secured
-                // Exception: If the Queen was pocketed this shot OR is currently pending a cover shot, clearing the last coin is a legal cover.
-                if ((coin == CoinType.White || coin == CoinType.Black) && GetBoardCoinCount(coin) == 0 && !queenSecured && !queenPocketedThisShot && !isQueenPending)
+                // Queen Last Rule
+                if (GetBoardCoinCount(coin) == 0 && !queenSecured && !queenPocketedThisShot && !isQueenPending)
                 {
                     byte illegalId = GetGraveyardCoinId(coin);
                     if (illegalId != 255) RespawnPiece(illegalId);
                     Debug.Log($"[CGM] Classic: Queen Last rule triggered for {coin} — coin returned");
-                    // Deny turn retention if the active player illegally cleared their own color
                     if (coin == myCoin) retainTurn = false;
-                    continue; // no score, no retain for this coin
+                    continue;
                 }
 
-                // Absolute scoring: coin always scores for its color's owner
-                if (coin == CoinType.White) networkScorePlayer.Value += 1;
-                else                        networkScoreEnemy.Value  += 1;
+                // Absolute scoring: White coins → seat 0 score (White team representative), Black → seat 1
+                // In Classic, each coin color scores for its team's first seat as a running total
+                if (coin == CoinType.White) score0.Value += 1;
+                else                        score1.Value += 1;
 
                 if (coin == myCoin) retainTurn = true;
             }
             else if (coin == CoinType.Striker)
             {
                 // --- Zero-Floor Policy ---
-                int currentScore = isHostTurn ? networkScorePlayer.Value : networkScoreEnemy.Value;
+                int currentScore = GetSeatScore(activeIdx);
 
                 if (currentScore <= 0)
                 {
-                    // Rule 1: Score already at zero — waive penalty entirely.
-                    // No deduction, no coin return. Turn is simply lost.
                     Debug.Log("[CGM] Classic: Striker foul — score at zero, penalty waived");
                 }
                 else
                 {
-                    // Rule 2: Strict color return — deduct 1 pt and return one owned coin.
-                    if (isHostTurn) networkScorePlayer.Value -= 1;
-                    else            networkScoreEnemy.Value  -= 1;
-
+                    AddSeatScore(activeIdx, -1);
                     byte penaltyId = GetGraveyardCoinId(myCoin);
                     if (penaltyId != 255)
                     {
@@ -646,8 +945,9 @@ public class CarromGameManager : NetworkBehaviour
         {
             if (hasStrictCover)
             {
-                if (isHostTurn) hostSecuredQueen.Value   = true;
-                else            clientSecuredQueen.Value = true;
+                // TODO: replace with per-seat queen flag when 4-player queen tracking is implemented
+                if (activeIdx == 0 || activeIdx == 2) hostSecuredQueen.Value = true;
+                else clientSecuredQueen.Value = true;
                 isQueenPending = false;
                 retainTurn = true;
                 Debug.Log("[CGM] Classic: Queen covered (follow-up) — Queen secured (0 pts)");
@@ -664,8 +964,9 @@ public class CarromGameManager : NetworkBehaviour
             retainTurn = true;
             if (hasStrictCover)
             {
-                if (isHostTurn) hostSecuredQueen.Value   = true;
-                else            clientSecuredQueen.Value = true;
+                // TODO: replace with per-seat queen flag when 4-player queen tracking is implemented
+                if (activeIdx == 0 || activeIdx == 2) hostSecuredQueen.Value = true;
+                else clientSecuredQueen.Value = true;
                 Debug.Log("[CGM] Classic: Queen same-shot cover — Queen secured (0 pts)");
             }
             else
@@ -675,14 +976,14 @@ public class CarromGameManager : NetworkBehaviour
             }
         }
 
-        // --- Ultimate Foul Override (The Guillotine Clause) ---
-        // Regardless of score, penalties waived, or Queen covers, a Striker foul forcibly ends the turn.
+        // --- Ultimate Foul Override ---
         if (shotLedger.Contains(CoinType.Striker))
         {
             retainTurn = false;
             Debug.Log("[CGM] Classic: Striker foul absolute override — turn forcibly lost");
         }
 
+        Debug.Log($"[CGM] Classic: White={WhiteTeamScore()} Black={BlackTeamScore()} | seat={activeIdx} myCoin={myCoin}");
         return retainTurn;
     }
 
@@ -806,33 +1107,48 @@ public class CarromGameManager : NetworkBehaviour
     {
         if (!IsSpawned || !IsServer) return;
 
+        Debug.Log($"[CGM:TELEM] TransferAuthority ENTER — activeSeatIndex={activeSeatIndex.Value}");
+
         // ---- Shot Ledger Evaluation (Turn Interceptor) ----
-        // Delegate entirely to the mode evaluator — it scores AND returns the retain decision.
         bool retainTurn = EvaluateShotLedger();
         Debug.Log($"[CarromGameManager] Ledger evaluated — retainTurn={retainTurn}, mode={currentGameMode}");
         shotLedger.Clear();
 
         if (retainTurn)
         {
-            // Active player keeps the turn — reset the striker in place without ownership transfer.
-            // ChangeOwnership(sameId) does NOT re-fire OnGainedOwnership, so we use an explicit RPC.
-            StrikerController striker = activeStriker != null
-                ? activeStriker.GetComponent<StrikerController>()
-                : null;
+            RetainCurrentSeat();
+            Debug.Log("[CarromGameManager] Turn retained — RetainCurrentSeat called");
 
-            if (striker != null)
-                striker.RetainTurnResetClientRpc();
-            else
-                Debug.LogWarning("[CarromGameManager] Could not find StrikerController for turn retention reset");
+            // If the retaining seat is a bot, re-trigger its shot routine so it
+            // takes the bonus turn. RetainCurrentSeat only resets the striker;
+            // it does NOT start a new BotShotRoutine.
+            SeatData retainingSeat = Roster[activeSeatIndex.Value];
+            if (retainingSeat.ControllerType == ControllerType.AI_Bot)
+            {
+                Debug.Log($"[CarromGameManager] Retained seat {activeSeatIndex.Value} is AI_Bot — triggering bonus shot");
+                TriggerBotShot(retainingSeat);
+            }
 
-            Debug.Log("[CarromGameManager] Turn retained — striker reset via RetainTurnResetClientRpc");
             return;
         }
 
         // ---- Normal turn pass ----
-        FlipTurn();
+        AdvanceTurn();
 
-        ulong newActivePlayerId = GetCurrentActivePlayerId();
+        // Telemetry: log rosterState seat data at the point we resolve the new owner
+        {
+            RosterState rs = rosterState.Value;
+            Debug.Log($"[CGM:TELEM] rosterState after AdvanceTurn — " +
+                      $"Seat0=({rs.Seat0.ControllerType},{rs.Seat0.OwnerClientId}) " +
+                      $"Seat1=({rs.Seat1.ControllerType},{rs.Seat1.OwnerClientId}) " +
+                      $"Seat2=({rs.Seat2.ControllerType},{rs.Seat2.OwnerClientId}) " +
+                      $"Seat3=({rs.Seat3.ControllerType},{rs.Seat3.OwnerClientId}) " +
+                      $"activeSeatIndex={activeSeatIndex.Value}");
+        }
+
+        ulong newActivePlayerId = GetActiveSeatOwnerClientId();
+        Debug.Log($"[CGM:TELEM] GetActiveSeatOwnerClientId() returned {newActivePlayerId} (MaxValue={ulong.MaxValue})");
+
         if (newActivePlayerId == ulong.MaxValue)
         {
             Debug.LogWarning("[CarromGameManager] Could not determine next active player");
@@ -854,6 +1170,28 @@ public class CarromGameManager : NetworkBehaviour
 
         Debug.Log($"[CarromGameManager] Authority → client {newActivePlayerId} ({transferred} pieces)");
         NotifyAuthorityChangeClientRpc(newActivePlayerId);
+
+        // ---- Post-ownership striker handoff ----
+        // Bot trigger and client reset happen AFTER ChangeOwnership has been issued to all pieces,
+        // ensuring no OnGainedOwnership callback can zero out a bot's velocity mid-flight.
+        int seatIdxForRpc = activeSeatIndex.Value;
+        SeatData newSeat = Roster[seatIdxForRpc];
+
+        Debug.Log($"[CGM:TELEM] activeStriker null={activeStriker == null}");
+        StrikerController striker = activeStriker != null ? activeStriker.GetComponent<StrikerController>() : null;
+        Debug.Log($"[CGM:TELEM] striker component null={striker == null}, newSeat.ControllerType={newSeat.ControllerType}, seatIdxForRpc={seatIdxForRpc}");
+
+        if (striker != null)
+        {
+            if (newSeat.ControllerType == ControllerType.AI_Bot)
+                TriggerBotShot(newSeat);
+            else
+                striker.ResetToBaselineClientRpc(seatIdxForRpc);
+        }
+        else
+        {
+            Debug.LogError("[CGM:TELEM] striker is NULL — ResetToBaselineClientRpc was NOT sent. Turn will hang.");
+        }
     }
 
     [ClientRpc]
@@ -880,6 +1218,29 @@ public class CarromGameManager : NetworkBehaviour
             if (!currentTurnIsHost && !isHostClient) return clientId;
         }
         return ulong.MaxValue;
+    }
+
+    /// <summary>
+    /// Returns the OwnerClientId for any seat by index, reading from the synced
+    /// NetworkVariable so clients have the same data as the server.
+    /// Returns ulong.MaxValue if not spawned or the seat is Closed.
+    /// </summary>
+    public ulong GetSeatOwnerClientId(int seatIndex)
+    {
+        if (!IsSpawned) return ulong.MaxValue;
+        SeatData seat = rosterState.Value[seatIndex];
+        Debug.Log($"[CGM:TELEM] GetSeatOwnerClientId({seatIndex}) — ControllerType={seat.ControllerType}, OwnerClientId={seat.OwnerClientId}");
+        if (seat.ControllerType == ControllerType.Closed) return ulong.MaxValue;
+        return seat.OwnerClientId;
+    }
+
+    /// <summary>
+    /// Returns the OwnerClientId of the currently active seat.
+    /// Returns ulong.MaxValue if not spawned or roster not yet populated.
+    /// </summary>
+    public ulong GetActiveSeatOwnerClientId()
+    {
+        return GetSeatOwnerClientId(activeSeatIndex.Value);
     }
 
     // -------------------------------------------------------------------------
