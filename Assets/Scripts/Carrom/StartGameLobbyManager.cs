@@ -6,39 +6,51 @@ using TMPro;
 using Unity.Netcode;
 using Unity.Services.Authentication;
 using Unity.Services.Core;
+using Unity.Services.Friends;
 using UnityEngine;
 using UnityEngine.UI;
 
 /*
- * StartGameLobbyManager — Offline-First Dynamic Lobby
+ * StartGameLobbyManager — Offline-First Dynamic Lobby with "Illusion of Life" UI
  *
- * Architecture:
- *  - All UI config (game mode, player count) is stored in LOCAL fields.
- *  - Network is NEVER touched in Start() / Awake().
- *  - Network init only happens inside OnPlayOnlineClicked() / OnInviteFriendsClicked().
- *  - OnNetworkSpawn() handles post-spawn role split (Host vs Client buttons).
- *  - IsSpawned guards protect every method that touches NetworkVariables or IsServer.
- *  - Ready state is tracked server-side in _readyStates (Dictionary<ulong,bool>).
- *  - Host is implicitly always ready — never added to _readyStates.
+ * Illusion of Life flows:
+ *  Flow A — Host slot 0 populated on OnNetworkSpawn with UGS name + avatar.
+ *  Flow B — Human client join: server requests name via RPC, broadcasts to all.
+ *  Flow C — MATCH button: fills vacant slots with FakeIdentityGenerator names,
+ *            synced to all clients via ClientRpc so both sides see fake humans.
  */
+
+// Slot UI descriptor — mirrors CharacterContainer from CharacterSelectionManager
+[Serializable]
+public struct LobbySlot
+{
+    public GameObject      waitingText;     // "WAITING..." overlay
+    public Image           avatarImage;     // Player avatar
+    public TextMeshProUGUI nameText;        // Display name
+    public GameObject      readyIndicator; // Optional ready badge
+}
 
 public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
 {
-    // ─── Inspector ────────────────────────────────────────────────────────────
+    // ── Inspector ─────────────────────────────────────────────────────────────
 
     [Header("Dropdowns")]
-    [SerializeField] private TMP_Dropdown gameModeDropdown;      // 0=Freestyle, 1=Classic
-    [SerializeField] private TMP_Dropdown playerCountDropdown;   // 0=2P, 1=3P, 2=4P
+    [SerializeField] private TMP_Dropdown gameModeDropdown;
+    [SerializeField] private TMP_Dropdown playerCountDropdown;
 
     [Header("Buttons")]
-    [SerializeField] private GameObject startGameButton;         // Host-only
-    [SerializeField] private GameObject readyButton;             // Client-only
-    [SerializeField] private GameObject cancelReadyButton;       // Client-only (toggle)
-    [SerializeField] private Button     playOnlineButton;        // Disabled during async connect
-    [SerializeField] private Button     inviteFriendsButton;     // Disabled during async connect
+    [SerializeField] private GameObject startGameButton;
+    [SerializeField] private GameObject readyButton;
+    [SerializeField] private GameObject cancelReadyButton;
+    [SerializeField] private Button     playOnlineButton;
+    [SerializeField] private Button     inviteFriendsButton;
+    [SerializeField] private Button     matchButton;
 
-    [Header("Slot Panels (optional visual)")]
-    [SerializeField] private GameObject[] slotPanels;            // 4 slot UI panels
+    [Header("Lobby Slots (4 max)")]
+    [SerializeField] private LobbySlot[] slots = new LobbySlot[4];
+
+    [Header("Default Avatars")]
+    [SerializeField] private Sprite[] defaultAvatars;
 
     [Header("Join Code Display")]
     [SerializeField] private TextMeshProUGUI joinCodeText;
@@ -46,82 +58,122 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
     [Header("Scene")]
     [SerializeField] private SceneName nextScene = SceneName.Carrom;
 
-    // ─── Network State ────────────────────────────────────────────────────────
+    // ── Network State ─────────────────────────────────────────────────────────
 
-    /// <summary>Synced ruleset — only written after OnNetworkSpawn on server.</summary>
     public NetworkVariable<GameMode> netCarromRuleset = new NetworkVariable<GameMode>(
         GameMode.Freestyle,
         NetworkVariableReadPermission.Everyone,
         NetworkVariableWritePermission.Server);
 
-    // ─── Local (Offline) State ────────────────────────────────────────────────
+    // ── Local State ───────────────────────────────────────────────────────────
 
     private GameMode _localGameMode    = GameMode.Freestyle;
-    private int      _localPlayerCount = 2;   // 2, 3, or 4
+    private int      _localPlayerCount = 2;
     private bool     _isPrivateLobby   = false;
 
-    // ─── Ready State (server-side only) ──────────────────────────────────────
+    // ── Ready State (server-side only) ────────────────────────────────────────
 
     private readonly Dictionary<ulong, bool> _readyStates = new Dictionary<ulong, bool>();
 
-    // ─── Static accessor for StartGameManager ────────────────────────────────
+    // ── Slot occupancy (all clients) ──────────────────────────────────────────
 
-    /// <summary>
-    /// Exposes the configured player count so StartGameManager can size the
-    /// Relay allocation dynamically instead of using a hardcoded value.
-    /// </summary>
+    private readonly string[] _slotNames = new string[4];
+
+    // ── Static accessor ───────────────────────────────────────────────────────
+
     public static int LocalPlayerCount => Instance != null ? Instance._localPlayerCount : 1;
 
-    // ─── Unity Lifecycle ──────────────────────────────────────────────────────
+    // ── Fake Identity Generator ───────────────────────────────────────────────
+
+    private static readonly string[] _namePrefixes =
+    {
+        "Guest", "Shadow", "Sniper", "Carrom", "King", "Ace", "Pro",
+        "Flash", "Storm", "Blaze", "Ghost", "Ninja", "Viper", "Hawk"
+    };
+
+    private static readonly string[] _nameSuffixes =
+    {
+        "X", "King", "Master", "99", "Pro", "Star", "Boss",
+        "Striker", "Legend", "Champ", "Wizard", "Hunter"
+    };
+
+    private static string GenerateFakeName()
+    {
+        string prefix = _namePrefixes[UnityEngine.Random.Range(0, _namePrefixes.Length)];
+        if (UnityEngine.Random.value < 0.5f)
+            return $"{prefix}_{UnityEngine.Random.Range(1000, 9999)}";
+        return $"{prefix}{_nameSuffixes[UnityEngine.Random.Range(0, _nameSuffixes.Length)]}";
+    }
+
+    private Sprite GetRandomAvatar()
+    {
+        if (defaultAvatars == null || defaultAvatars.Length == 0) return null;
+        return defaultAvatars[UnityEngine.Random.Range(0, defaultAvatars.Length)];
+    }
+
+    // ── Unity Lifecycle ───────────────────────────────────────────────────────
 
     public override void Awake()
     {
-        // Singleton re-entry guard: if a stale instance exists, shut down any
-        // live NGO session before the base class destroys it (Req 13.1).
         if (Instance != null && Instance != this)
         {
             if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsListening)
             {
-                Debug.Log("[StartGameLobbyManager] Stale NGO session detected — shutting down.");
+                Debug.Log("[StartGameLobbyManager] Stale NGO session — shutting down.");
                 NetworkManager.Singleton.Shutdown();
             }
-            // Let base.Awake() handle Destroy(gameObject) on the old instance
-            // by temporarily nulling it so the base class re-registers this one.
             Destroy(Instance.gameObject);
         }
         base.Awake();
     }
 
-    private void Start()
+    private async void Start()
     {
-        // Offline-only setup — no network calls here (Req 1.1, 1.2).
+        // Step 1: Wire up UI that doesn't need auth first — instant, no blocking.
         if (gameModeDropdown != null)
         {
-            gameModeDropdown.value = (int)_localGameMode;   // default Freestyle (Req 1.3)
+            gameModeDropdown.value = (int)_localGameMode;
             gameModeDropdown.onValueChanged.AddListener(OnGameModeChanged);
         }
 
         if (playerCountDropdown != null)
         {
-            playerCountDropdown.value = 0;                  // default 2P (Req 1.3)
+            playerCountDropdown.value = 0;
             playerCountDropdown.onValueChanged.AddListener(OnPlayerCountChanged);
         }
 
         ApplyPlayerCountToUI(_localPlayerCount);
+        ResetAllSlotsToWaiting();
 
-        // Programmatic binding — ensures clicks fire regardless of Inspector wiring
-        if (playOnlineButton    != null) playOnlineButton.onClick.AddListener(OnPlayOnlineClicked);
-        if (inviteFriendsButton != null) inviteFriendsButton.onClick.AddListener(OnInviteFriendsClicked);
+        // Only MATCH and Start are still relevant — Online/Invite are deprecated.
+        if (matchButton != null) matchButton.onClick.AddListener(OnMatchClicked);
         if (startGameButton != null && startGameButton.TryGetComponent<Button>(out var startBtn))
             startBtn.onClick.AddListener(OnStartGameClicked);
 
-        // Both action buttons hidden until OnNetworkSpawn fires (Req 1.4)
         SetButtonVisibility(isHost: false, isSpawned: false);
+
+        // Step 2: Authenticate — awaited so PlayerName is ready before slot population.
+        try
+        {
+            await InitializeNetworkServices();
+            Debug.Log("[StartGameLobbyManager] UGS ready on scene load.");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[StartGameLobbyManager] UGS init on Start failed: {e.Message}");
+        }
+
+        // Step 3: Populate local slot immediately — offline, no network dependency.
+        InitHostSlot();
+
+        // Step 4: Kick off the private lobby creation in the background.
+        // Fire-and-forget: does NOT block the rest of the UI or scene animations.
+        if (joinCodeText != null) joinCodeText.text = "Generating Code...";
+        _ = AutoCreatePrivateLobbyAsync();
     }
 
     private void OnDisable()
     {
-        // Null-guard required: NetworkManager may already be destroyed (Req 13.3)
         if (IsSpawned && IsServer && NetworkManager.Singleton != null)
         {
             NetworkManager.Singleton.OnClientDisconnectCallback -= OnClientDisconnected;
@@ -129,14 +181,164 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
         }
     }
 
-    // ─── Offline UI Callbacks ─────────────────────────────────────────────────
+    // ── Slot UI Primitives ────────────────────────────────────────────────────
 
-    /// <summary>Req 2.3 — update local game mode when dropdown changes.</summary>
+    /// <summary>
+    /// Resets a slot to the empty "WAITING..." state.
+    /// Mirrors SetNonPlayableChar() from CharacterSelectionManager.
+    /// </summary>
+    private void SetSlotWaiting(int i)
+    {
+        if (i < 0 || i >= slots.Length) return;
+        if (slots[i].waitingText    != null) slots[i].waitingText.SetActive(true);
+        if (slots[i].avatarImage    != null) slots[i].avatarImage.gameObject.SetActive(false);
+        if (slots[i].nameText       != null) slots[i].nameText.text = "";
+        if (slots[i].readyIndicator != null) slots[i].readyIndicator.SetActive(false);
+        _slotNames[i] = "";
+    }
+
+    /// <summary>
+    /// Populates a slot with a name and avatar.
+    /// Mirrors SetPlayebleChar() from CharacterSelectionManager.
+    /// </summary>
+    private void SetSlotOccupied(int i, string displayName, Sprite avatar = null)
+    {
+        if (i < 0 || i >= slots.Length) return;
+        if (slots[i].waitingText != null) slots[i].waitingText.SetActive(false);
+        if (slots[i].nameText    != null) slots[i].nameText.text = displayName;
+        if (slots[i].avatarImage != null)
+        {
+            slots[i].avatarImage.gameObject.SetActive(true);
+            // Reset alpha to fully opaque — prefab default may be transparent (alpha=0)
+            // mirroring CharacterSelectionManager's SetNonPlayableChar color reset pattern.
+            slots[i].avatarImage.color = Color.white;
+            if (avatar != null) slots[i].avatarImage.sprite = avatar;
+        }
+        _slotNames[i] = displayName;
+    }
+
+    private void ResetAllSlotsToWaiting()
+    {
+        for (int i = 0; i < slots.Length; i++) SetSlotWaiting(i);
+    }
+
+    private int FindNextVacantSlot()
+    {
+        for (int i = 0; i < _localPlayerCount && i < slots.Length; i++)
+            if (string.IsNullOrEmpty(_slotNames[i])) return i;
+        return -1;
+    }
+
+    // ── Flow A: Host Initialization ───────────────────────────────────────────
+
+    private void InitHostSlot()
+    {
+        string name = AuthenticationService.Instance.PlayerName
+                   ?? AuthenticationService.Instance.PlayerId
+                   ?? "Host";
+        SetSlotOccupied(0, name, GetRandomAvatar());
+        Debug.Log($"[StartGameLobbyManager] Flow A — Host slot 0: '{name}'");
+    }
+
+    // ── Flow B: Human Client Connection ──────────────────────────────────────
+
+    private void OnClientConnected(ulong clientId)
+    {
+        if (!IsSpawned || !IsServer) return;
+
+        // Guard: the host's own connection fires this callback too.
+        // Slot 0 is already populated by InitHostSlot() — skip it here.
+        if (clientId == NetworkManager.ServerClientId) return;
+
+        _readyStates[clientId] = true;
+        Debug.Log($"[StartGameLobbyManager] Client {clientId} connected — syncing lobby state then requesting name.");
+
+        ClientRpcParams toNewClient = new ClientRpcParams
+        {
+            Send = new ClientRpcSendParams { TargetClientIds = new[] { clientId } }
+        };
+
+        // Bug B fix: push every already-occupied slot to the new client so they
+        // see the host (and any other players) that joined before them.
+        for (int i = 0; i < _slotNames.Length; i++)
+        {
+            if (!string.IsNullOrEmpty(_slotNames[i]))
+            {
+                Debug.Log($"[StartGameLobbyManager] Late-join sync → client {clientId}: slot {i} = '{_slotNames[i]}'");
+                SyncSlotToClientRpc(i, _slotNames[i], toNewClient);
+            }
+        }
+
+        // Now ask the new client for their own name so we can fill the next vacant slot.
+        RequestClientNameClientRpc(toNewClient);
+        RefreshStartButtonState();
+    }
+
+    /// <summary>
+    /// Targeted RPC that syncs a single already-occupied slot to one specific client.
+    /// Used for late-joiner state catch-up — avoids broadcasting to everyone.
+    /// </summary>
+    [ClientRpc]
+    private void SyncSlotToClientRpc(int slotIndex, string displayName, ClientRpcParams clientRpcParams = default)
+    {
+        SetSlotOccupied(slotIndex, displayName, GetRandomAvatar());
+    }
+
+    [ClientRpc]
+    private void RequestClientNameClientRpc(ClientRpcParams clientRpcParams = default)
+    {
+        string name = AuthenticationService.Instance.PlayerName
+                   ?? AuthenticationService.Instance.PlayerId
+                   ?? "Player";
+        ReportClientNameServerRpc(name);
+    }
+
+    [ServerRpc(RequireOwnership = false)]
+    private void ReportClientNameServerRpc(string playerName, ServerRpcParams rpcParams = default)
+    {
+        int slot = FindNextVacantSlot();
+        if (slot < 0)
+        {
+            Debug.LogWarning("[StartGameLobbyManager] Flow B — no vacant slot for incoming client.");
+            return;
+        }
+        Debug.Log($"[StartGameLobbyManager] Flow B — slot {slot}: '{playerName}'");
+        OccupySlotClientRpc(slot, playerName);
+    }
+
+    // ── Flow C: MATCH Button ──────────────────────────────────────────────────
+
+    public void OnMatchClicked()
+    {
+        if (!IsSpawned || !IsServer) return;
+        Debug.Log("[StartGameLobbyManager] Flow C — MATCH: filling vacant slots.");
+
+        for (int i = 0; i < _localPlayerCount && i < slots.Length; i++)
+        {
+            if (!string.IsNullOrEmpty(_slotNames[i])) continue;
+            string fakeName = GenerateFakeName();
+            Debug.Log($"[StartGameLobbyManager] Flow C — slot {i}: '{fakeName}'");
+            OccupySlotClientRpc(i, fakeName);
+        }
+
+        int humanCount = NetworkManager.Singleton.ConnectedClientsIds.Count;
+        CarromGameManager.PendingBotCount = _localPlayerCount - humanCount;
+    }
+
+    // ── Shared Slot Sync RPC ──────────────────────────────────────────────────
+
+    [ClientRpc]
+    private void OccupySlotClientRpc(int slotIndex, string displayName)
+    {
+        SetSlotOccupied(slotIndex, displayName, GetRandomAvatar());
+    }
+
+    // ── Offline UI Callbacks ──────────────────────────────────────────────────
+
     private void OnGameModeChanged(int index)
     {
         _localGameMode = (GameMode)index;
 
-        // 3-Player Interlock: Classic is invalid with 3 players (Req 3.2)
         if (_localGameMode == GameMode.Classic && _localPlayerCount == 3)
         {
             _localGameMode = GameMode.Freestyle;
@@ -145,20 +347,16 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
             Debug.Log("[StartGameLobbyManager] Classic requires 2 or 4 players — reverted to Freestyle.");
         }
 
-        // Push to network only when already spawned as host (Req 9.1, 9.3)
         if (IsSpawned && IsServer)
             netCarromRuleset.Value = _localGameMode;
 
         Debug.Log($"[StartGameLobbyManager] Local game mode: {_localGameMode}");
     }
 
-    /// <summary>Req 2.4 — update local player count when dropdown changes.</summary>
     private void OnPlayerCountChanged(int index)
     {
-        // Dropdown: 0=2P, 1=3P, 2=4P  →  _localPlayerCount = index + 2
         _localPlayerCount = index + 2;
 
-        // 3-Player Interlock: Classic is invalid with 3 players (Req 3.1)
         if (_localPlayerCount == 3 && _localGameMode == GameMode.Classic)
         {
             _localGameMode = GameMode.Freestyle;
@@ -166,88 +364,39 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
                 gameModeDropdown.value = (int)GameMode.Freestyle;
             Debug.Log("[StartGameLobbyManager] 3-player selected — Classic forced to Freestyle.");
 
-            // Push to network if already spawned (Req 3.4)
             if (IsSpawned && IsServer)
                 netCarromRuleset.Value = GameMode.Freestyle;
         }
 
-        ApplyPlayerCountToUI(_localPlayerCount);   // Req 2.5
+        ApplyPlayerCountToUI(_localPlayerCount);
         Debug.Log($"[StartGameLobbyManager] Local player count: {_localPlayerCount}");
     }
 
-    /// <summary>
-    /// Activates slot panels sequentially from index 0 to count-1.
-    ///
-    /// UI layout (two-column grid):
-    ///   Index 0 = P1 (Left,  Top)    Index 1 = P2 (Right, Top)
-    ///   Index 2 = P3 (Left,  Bottom) Index 3 = P4 (Right, Bottom)
-    ///
-    /// Activation by player count:
-    ///   2P → [0,1] active,  [2,3] inactive   (1v1)
-    ///   3P → [0,1,2] active,[3]   inactive   (Freestyle only)
-    ///   4P → [0,1,2,3] all active            (2v2: Team White=P1/P3, Team Black=P2/P4)
-    ///
-    /// Null-safe: skips null elements and returns early if array is null/empty (Req 4.3, 4.4).
-    /// </summary>
     private void ApplyPlayerCountToUI(int count)
     {
-        if (slotPanels == null || slotPanels.Length == 0) return;
-        for (int i = 0; i < slotPanels.Length; i++)
+        for (int i = 0; i < slots.Length; i++)
         {
-            if (slotPanels[i] != null)
-                slotPanels[i].SetActive(i < count);
+            // The slot root is the parent of waitingText; fall back to avatarImage parent
+            Transform root = slots[i].waitingText  != null ? slots[i].waitingText.transform.parent
+                           : slots[i].avatarImage  != null ? slots[i].avatarImage.transform.parent
+                           : null;
+            if (root != null) root.gameObject.SetActive(i < count);
         }
     }
 
-    // ─── Button Handlers (wired in Inspector) ─────────────────────────────────
+    // ── Auto-Host (Background Task) ──────────────────────────────────────────
 
-    /// <summary>Called by the [Play Online] button (Req 5.1).</summary>
-    public async void OnPlayOnlineClicked()
+    /// <summary>
+    /// Silently creates a private lobby and starts the NGO Host session in the
+    /// background. Called fire-and-forget from Start() so it never blocks the UI.
+    /// On success, joinCodeText updates to the real join code.
+    /// </summary>
+    private async Task AutoCreatePrivateLobbyAsync()
     {
-        Debug.Log("[StartGameLobbyManager] Button clicked!");
         try
         {
-            if (playOnlineButton   != null) playOnlineButton.interactable   = false;
-            if (inviteFriendsButton != null) inviteFriendsButton.interactable = false;
+            Debug.Log("[StartGameLobbyManager] AutoHost — creating private lobby...");
 
-            _isPrivateLobby = false;
-            await InitializeNetworkServices();
-
-            // Join or create a public lobby, then set up the NGO session immediately.
-            // QuickJoinOrCreatePublicLobbyAsync returns true if we became the host.
-            bool isHost = await LobbyManager.Instance.QuickJoinOrCreatePublicLobbyAsync();
-
-            if (isHost)
-            {
-                // We created the lobby — allocate Relay and StartHost.
-                bool ok = await StartGameManager.Instance.CreateRelayAsync();
-                if (!ok) Debug.LogError("[StartGameLobbyManager] Relay creation failed.");
-            }
-            // If isHost == false: we joined an existing lobby as a client.
-            // HandleLobbyPolling in LobbyManager will detect the relay code and
-            // call JoinRelayAsync automatically, which fires OnNetworkSpawn on this client.
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"[StartGameLobbyManager] OnPlayOnlineClicked failed: {e.Message}");
-            if (playOnlineButton   != null) playOnlineButton.interactable   = true;
-            if (inviteFriendsButton != null) inviteFriendsButton.interactable = true;
-        }
-    }
-
-    /// <summary>Called by the [Invite Friends] button (Req 5.2, 5.3, 5.4).</summary>
-    public async void OnInviteFriendsClicked()
-    {
-        Debug.Log("[StartGameLobbyManager] Button clicked!");
-        try
-        {
-            if (playOnlineButton   != null) playOnlineButton.interactable   = false;
-            if (inviteFriendsButton != null) inviteFriendsButton.interactable = false;
-
-            _isPrivateLobby = true;
-            await InitializeNetworkServices();
-
-            // Create private lobby (isHostLobby: true suppresses auto-navigation).
             LobbyManager.Instance.CreateLobby(
                 "Carrom Private",
                 _localPlayerCount,
@@ -255,40 +404,60 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
                 LobbyManager.GameMode.Carrom,
                 isHostLobby: true);
 
-            // Immediately allocate Relay and StartHost so OnNetworkSpawn fires
-            // and the waiting room UI becomes active (Start Game button visible).
             bool ok = await StartGameManager.Instance.CreateRelayAsync();
-            if (!ok) Debug.LogError("[StartGameLobbyManager] Relay creation failed.");
+            if (!ok)
+            {
+                Debug.LogError("[StartGameLobbyManager] AutoHost — Relay creation failed.");
+                if (joinCodeText != null) joinCodeText.text = "Code: Error";
+                return;
+            }
+
+            // NGO Host is now running — OnNetworkSpawn will fire and update the join code.
+            Debug.Log("[StartGameLobbyManager] AutoHost — NGO Host started successfully.");
         }
         catch (Exception e)
         {
-            Debug.LogError($"[StartGameLobbyManager] OnInviteFriendsClicked failed: {e.Message}");
-            if (playOnlineButton   != null) playOnlineButton.interactable   = true;
-            if (inviteFriendsButton != null) inviteFriendsButton.interactable = true;
+            Debug.LogError($"[StartGameLobbyManager] AutoHost failed: {e.Message}");
+            if (joinCodeText != null) joinCodeText.text = "Code: Error";
         }
     }
 
-    /// <summary>Host-only: start the game (Req 8.1).</summary>
+    // ── Deprecated Button Handlers (kept as stubs for scene compatibility) ────
+
+    /// <summary>Deprecated — auto-hosting replaces this flow.</summary>
+    public void OnPlayOnlineClicked()
+    {
+        Debug.Log("[StartGameLobbyManager] OnPlayOnlineClicked — deprecated, auto-host is active.");
+    }
+
+    /// <summary>Opens the Friends panel via PanelManager.</summary>
+    public void OnInviteFriendsClicked()
+    {
+        Debug.Log("[StartGameLobbyManager] OnInviteFriendsClicked fired.");
+        try
+        {
+            PanelManager.Open("friends");
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[StartGameLobbyManager] OnInviteFriendsClicked failed: {e.Message}\n{e.StackTrace}");
+        }
+    }
+
     public void OnStartGameClicked()
     {
-        Debug.Log("[StartGameLobbyManager] Start Game button clicked!");
         if (!IsSpawned || !IsServer) return;
         StartGame();
     }
 
-    /// <summary>Client-only: toggle ready state via ServerRpc (Req 11.3).</summary>
     public void OnReadyClicked()
     {
         if (!IsSpawned || IsServer) return;
         ToggleReadyServerRpc();
     }
 
-    // ─── Network Initialization ───────────────────────────────────────────────
+    // ── Network Initialization ────────────────────────────────────────────────
 
-    /// <summary>
-    /// Idempotent Unity Services init + anonymous sign-in (Req 6.1, 6.2, 6.3).
-    /// Safe to call multiple times — skips steps already completed.
-    /// </summary>
     private async Task InitializeNetworkServices()
     {
         if (UnityServices.State != ServicesInitializationState.Initialized)
@@ -302,42 +471,49 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
             await AuthenticationService.Instance.SignInAnonymouslyAsync();
             Debug.Log("[StartGameLobbyManager] Signed in anonymously.");
         }
+
+        // Initialize Friends service — safe to call even if already initialized.
+        try
+        {
+            await FriendsService.Instance.InitializeAsync();
+            Debug.Log("[StartGameLobbyManager] Friends service initialized.");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[StartGameLobbyManager] Friends service init skipped: {e.Message}");
+        }
     }
 
-    // ─── NGO Lifecycle ────────────────────────────────────────────────────────
+    // ── NGO Lifecycle ─────────────────────────────────────────────────────────
 
     public override void OnNetworkSpawn()
     {
         if (IsServer)
         {
-            // Initial authoritative sync of local config to network (Req 9.2)
             netCarromRuleset.Value = _localGameMode;
 
-            // Subscribe to connect/disconnect for ready state tracking (Req 11.1)
             NetworkManager.Singleton.OnClientConnectedCallback  += OnClientConnected;
             NetworkManager.Singleton.OnClientDisconnectCallback += OnClientDisconnected;
 
-            // Display join code if a private lobby was created (Req 8.5)
             if (joinCodeText != null && !string.IsNullOrEmpty(LobbyManager.LastLobbyCode))
                 joinCodeText.text = $"Code: {LobbyManager.LastLobbyCode}";
 
-            // Host keeps dropdowns interactable (Req 8.4)
-            if (gameModeDropdown != null)    gameModeDropdown.interactable    = true;
+            if (gameModeDropdown    != null) gameModeDropdown.interactable    = true;
             if (playerCountDropdown != null) playerCountDropdown.interactable = true;
 
-            SetButtonVisibility(isHost: true, isSpawned: true);  // Req 8.1
+            SetButtonVisibility(isHost: true, isSpawned: true);
             RefreshStartButtonState();
+            // Flow A is handled in Start() — slot 0 is already populated offline.
+            // No InitHostSlot() call needed here.
         }
         else
         {
-            // Clients: read-only dropdowns (Req 8.3)
-            if (gameModeDropdown != null)    gameModeDropdown.interactable    = false;
+            if (gameModeDropdown    != null) gameModeDropdown.interactable    = false;
             if (playerCountDropdown != null) playerCountDropdown.interactable = false;
 
-            SetButtonVisibility(isHost: false, isSpawned: true);  // Req 8.2
+            SetButtonVisibility(isHost: false, isSpawned: true);
         }
 
-        // Sync dropdown to live network value on spawn + subscribe to future changes (Req 9.4)
         netCarromRuleset.OnValueChanged += (_, newMode) =>
         {
             if (gameModeDropdown != null)
@@ -348,30 +524,16 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
             gameModeDropdown.value = (int)netCarromRuleset.Value;
     }
 
-    // ─── Ready State ──────────────────────────────────────────────────────────
+    // ── Ready State ───────────────────────────────────────────────────────────
 
-    /// <summary>Server: new client defaults to ready = true (Req 11.2).</summary>
-    private void OnClientConnected(ulong clientId)
-    {
-        if (!IsSpawned || !IsServer) return;
-        _readyStates[clientId] = true;
-        Debug.Log($"[StartGameLobbyManager] Client {clientId} connected — ready by default.");
-        RefreshStartButtonState();
-    }
-
-    /// <summary>Server: remove client from ready tracking on disconnect.</summary>
     private void OnClientDisconnected(ulong clientId)
     {
         if (!IsSpawned || !IsServer) return;
         _readyStates.Remove(clientId);
-        Debug.Log($"[StartGameLobbyManager] Client {clientId} disconnected from lobby.");
+        Debug.Log($"[StartGameLobbyManager] Client {clientId} disconnected.");
         RefreshStartButtonState();
     }
 
-    /// <summary>
-    /// Client → Server: toggle this client's ready state (Req 11.3).
-    /// RequireOwnership = false so any client can call it.
-    /// </summary>
     [ServerRpc(RequireOwnership = false)]
     public void ToggleReadyServerRpc(ServerRpcParams rpcParams = default)
     {
@@ -379,67 +541,47 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
         if (_readyStates.ContainsKey(clientId))
             _readyStates[clientId] = !_readyStates[clientId];
         else
-            _readyStates[clientId] = false; // first toggle from default-true → not ready
+            _readyStates[clientId] = false;
 
         bool isReady = _readyStates[clientId];
-        Debug.Log($"[StartGameLobbyManager] Client {clientId} ready state → {isReady}");
+        Debug.Log($"[StartGameLobbyManager] Client {clientId} ready → {isReady}");
 
         UpdateReadyStateClientRpc(clientId, isReady);
         RefreshStartButtonState();
     }
 
-    /// <summary>
-    /// Server → All clients: push ready state update for slot panel UI (Req 11.3).
-    /// </summary>
     [ClientRpc]
     private void UpdateReadyStateClientRpc(ulong clientId, bool isReady)
     {
-        // Slot panel ready indicator update goes here when slot panel UI is wired.
         Debug.Log($"[StartGameLobbyManager] [ClientRpc] Client {clientId} ready: {isReady}");
+        // Wire ready indicator per slot here if needed
     }
 
-    /// <summary>
-    /// Recomputes startGameButton interactable state (Req 11.4, 11.5).
-    /// Enabled iff at least one client is connected AND all are ready.
-    /// </summary>
     private void RefreshStartButtonState()
     {
         if (!IsServer || startGameButton == null) return;
-
         bool allReady = _readyStates.Count == 0 || _readyStates.Values.All(v => v);
-        Button btn = startGameButton.GetComponent<Button>();
-        if (btn != null)
+        if (startGameButton.TryGetComponent<Button>(out var btn))
             btn.interactable = allReady;
     }
 
-    // ─── Game Start ───────────────────────────────────────────────────────────
+    // ── Game Start ────────────────────────────────────────────────────────────
 
     private void StartGame()
     {
-        // Ghost Bot Injector: silently fill empty seats (Req 12.1–12.5)
         InjectGhostBots();
-
         CarromGameManager.ActiveRuleset = netCarromRuleset.Value;
-        Debug.Log($"[StartGameLobbyManager] Starting game — ruleset: {CarromGameManager.ActiveRuleset}, players: {_localPlayerCount}");
-
-        // Trigger fade on all clients, then load the scene (server-authoritative).
+        Debug.Log($"[StartGameLobbyManager] Starting — ruleset: {CarromGameManager.ActiveRuleset}");
         StartGameClientRpc();
         LoadingSceneManager.Instance.LoadScene(nextScene);
     }
 
-    /// <summary>
-    /// Ghost Bot Injector — no UI, no confirmation (Req 12.2).
-    /// Snapshots ConnectedClientsIds.Count at call time (before scene load).
-    /// </summary>
     private void InjectGhostBots()
     {
         int humanCount = NetworkManager.Singleton.ConnectedClientsIds.Count;
         int botCount   = _localPlayerCount - humanCount;
-
         if (botCount > 0)
-            Debug.Log($"[StartGameLobbyManager] Ghost Bot Injector: {botCount} bot(s) will fill empty seats.");
-
-        // Store for CarromGameManager to consume on spawn (Req 12.1, 12.3)
+            Debug.Log($"[StartGameLobbyManager] Ghost Bot Injector: {botCount} bot(s).");
         CarromGameManager.PendingPlayerCount = _localPlayerCount;
         CarromGameManager.PendingBotCount    = botCount;
     }
@@ -450,12 +592,14 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
         LoadingFadeEffect.Instance.FadeAll();
     }
 
-    // ─── UI Helpers ───────────────────────────────────────────────────────────
+    // ── UI Helpers ────────────────────────────────────────────────────────────
 
     private void SetButtonVisibility(bool isHost, bool isSpawned)
     {
         if (startGameButton   != null) startGameButton.SetActive(isSpawned && isHost);
         if (readyButton       != null) readyButton.SetActive(isSpawned && !isHost);
         if (cancelReadyButton != null) cancelReadyButton.SetActive(false);
+        // MATCH button is host-only and only useful while spawned
+        if (matchButton != null) matchButton.gameObject.SetActive(isSpawned && isHost);
     }
 }

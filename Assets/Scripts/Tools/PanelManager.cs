@@ -76,7 +76,13 @@ public class PanelManager : MonoBehaviour
         var panel = GetSingleton(id);
         if (panel != null)
         {
+            Debug.Log($"[PanelManager] Opening panel: {id}");
+            panel.transform.SetAsLastSibling();
             panel.Open();
+        }
+        else
+        {
+            Debug.LogWarning($"[PanelManager] Open failed — panel '{id}' not found.");
         }
     }
     

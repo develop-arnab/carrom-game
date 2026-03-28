@@ -34,6 +34,7 @@ public class ActionConfirmMenu : Panel
     
     public void Open(Callback callback, string message = "Quit?", string buttonPositive = "Exit", string buttonNegative = "Play")
     {
+        Debug.Log($"[ActionConfirmMenu] Open() called — message='{message}'");
         Open();
         this.callback = callback;
         if (string.IsNullOrEmpty(message) == false)
@@ -48,6 +49,7 @@ public class ActionConfirmMenu : Panel
         {
             buttonNegativeText.text = buttonNegative;
         }
+        Debug.Log($"[ActionConfirmMenu] Open() complete — container active={gameObject.activeSelf}");
     }
     
     private void Positive()

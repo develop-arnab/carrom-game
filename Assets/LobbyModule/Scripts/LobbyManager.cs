@@ -3,10 +3,29 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using Unity.Services.Authentication;
 using Unity.Services.Core;
+using Unity.Services.Friends;
+using Unity.Services.Friends.Notifications;
 using Unity.Services.Lobbies;
 using Unity.Services.Lobbies.Models;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+
+/// <summary>
+/// Message payload sent via FriendsService.MessageAsync to invite a friend to a lobby.
+/// Must have an empty constructor and be JSON-serializable (required by IMessagingService).
+/// </summary>
+[Serializable]
+public class LobbyInviteMessage
+{
+    public string LobbyId;
+    public string InviterName;
+    public LobbyInviteMessage() { }
+    public LobbyInviteMessage(string lobbyId, string inviterName)
+    {
+        LobbyId     = lobbyId;
+        InviterName = inviterName;
+    }
+}
 
 public class LobbyManager : MonoBehaviour {
 
@@ -42,6 +61,17 @@ public class LobbyManager : MonoBehaviour {
     public class OnLobbyListChangedEventArgs : EventArgs {
         public List<Lobby> lobbyList;
     }
+
+    // ── Phase 2: Real-Time Invite System ─────────────────────────────────────
+
+    /// <summary>
+    /// Raised on the main thread when a lobby invite message is received via FriendsService.
+    /// Payload: (lobbyId, inviterName)
+    /// </summary>
+    public event Action<string, string> OnInviteReceived;
+
+    private string _pendingInviteLobbyId;
+    private string _pendingInviterName;
 
 
     public enum GameMode {
@@ -80,14 +110,42 @@ public class LobbyManager : MonoBehaviour {
     public static string LastLobbyCode { get; private set; } = "";
 
     private void Start() {
-        // If Unity Services is already initialized and player is signed in (from MainMenuManager),
-        // grab the player name from AuthenticationService directly.
-        if (Unity.Services.Core.UnityServices.State == Unity.Services.Core.ServicesInitializationState.Initialized
-            && AuthenticationService.Instance.IsSignedIn)
+        // UGS may not be initialized yet when LobbyManager.Start() runs.
+        // Start a coroutine that waits for UGS to be ready, then hooks into auth.
+        StartCoroutine(WaitForUgsAndSetupFriends());
+    }
+
+    private System.Collections.IEnumerator WaitForUgsAndSetupFriends()
+    {
+        // Wait until UnityServices is initialized
+        yield return new WaitUntil(() =>
+            Unity.Services.Core.UnityServices.State == Unity.Services.Core.ServicesInitializationState.Initialized);
+
+        // Subscribe to future sign-in events (covers the case where sign-in hasn't happened yet)
+        AuthenticationService.Instance.SignedIn += OnSignedIn;
+
+        // If already signed in (e.g. returning from another scene), initialize immediately
+        if (AuthenticationService.Instance.IsSignedIn)
         {
             playerName = AuthenticationService.Instance.PlayerName ?? AuthenticationService.Instance.PlayerId;
-            Debug.Log("[LobbyManager] Using existing auth session, player: " + playerName);
+            Debug.Log("[LobbyManager] Already signed in — initializing Friends. Player: " + playerName);
+            _ = InitializeFriendsAndListenAsync();
         }
+    }
+
+    private void OnDestroy()
+    {
+        if (Unity.Services.Core.UnityServices.State == Unity.Services.Core.ServicesInitializationState.Initialized)
+        {
+            try { AuthenticationService.Instance.SignedIn -= OnSignedIn; } catch { }
+        }
+    }
+
+    private void OnSignedIn()
+    {
+        playerName = AuthenticationService.Instance.PlayerName ?? AuthenticationService.Instance.PlayerId;
+        Debug.Log("[LobbyManager] SignedIn event — initializing Friends service. Player: " + playerName);
+        _ = InitializeFriendsAndListenAsync();
     }
 
     private void Update() {
@@ -113,6 +171,7 @@ public class LobbyManager : MonoBehaviour {
         };
 
         await AuthenticationService.Instance.SignInAnonymouslyAsync();
+        _ = InitializeFriendsAndListenAsync();
     }
 
     private void HandleRefreshLobbyList() {
@@ -520,5 +579,100 @@ public class LobbyManager : MonoBehaviour {
         }
     }
 
+    // ── Phase 2: Real-Time Invite System ─────────────────────────────────────
+
+    /// <summary>
+    /// Initializes FriendsService (opens the messaging websocket) then registers
+    /// the MessageReceived listener. Called after every successful authentication
+    /// so the invite socket is open regardless of which UI the player is viewing.
+    /// </summary>
+    private async Task InitializeFriendsAndListenAsync()
+    {
+        try
+        {
+            await FriendsService.Instance.InitializeAsync();
+            Debug.Log("[LobbyManager] FriendsService initialized — messaging socket open.");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[LobbyManager] FriendsService.InitializeAsync failed: {e.Message}");
+        }
+        SetupInviteListener();
+    }
+
+    /// <summary>
+    /// Subscribes to FriendsService.MessageReceived to detect incoming lobby invites.
+    /// Safe to call multiple times — always unsubscribes first to prevent duplicate handlers.
+    /// Must be called after FriendsService.Instance.InitializeAsync() has completed.
+    /// </summary>
+    private void SetupInviteListener()
+    {
+        try
+        {
+            FriendsService.Instance.MessageReceived -= HandleMessageReceived;
+            FriendsService.Instance.MessageReceived += HandleMessageReceived;
+            Debug.Log("[LobbyManager] FriendsService.MessageReceived listener registered.");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[LobbyManager] SetupInviteListener failed (FriendsService may not be initialized yet): {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// FriendsService.MessageReceived callback — may arrive on a background thread.
+    /// Deserializes the payload as LobbyInviteMessage, then marshals to the main thread.
+    /// </summary>
+    private void HandleMessageReceived(IMessageReceivedEvent e)
+    {
+        try
+        {
+            LobbyInviteMessage invite = e.GetAs<LobbyInviteMessage>();
+            if (invite == null || string.IsNullOrEmpty(invite.LobbyId))
+            {
+                Debug.LogWarning("[LobbyManager] HandleMessageReceived — invite payload null or missing LobbyId.");
+                return;
+            }
+
+            _pendingInviteLobbyId = invite.LobbyId;
+            _pendingInviterName   = invite.InviterName ?? e.UserId;
+            Debug.Log($"[LobbyManager] Invite message received from '{_pendingInviterName}' for lobby {_pendingInviteLobbyId}");
+            Debug.Log($"[LobbyManager] OnInviteReceived subscriber count: {(OnInviteReceived == null ? 0 : OnInviteReceived.GetInvocationList().Length)}");
+
+            string lobbyId     = _pendingInviteLobbyId;
+            string inviterName = _pendingInviterName;
+
+            Debug.Log("[LobbyManager] Enqueueing OnInviteReceived dispatch to main thread.");
+            MainThreadDispatcher.Enqueue(() =>
+            {
+                Debug.Log("[LobbyManager] MainThreadDispatcher executing — raising OnInviteReceived.");
+                OnInviteReceived?.Invoke(lobbyId, inviterName);
+            });
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[LobbyManager] HandleMessageReceived — failed to parse invite: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Joins a lobby by its ID (used by the invite accept flow — no code entry required).
+    /// Resets alreadyStartedGame so HandleLobbyPolling can detect the relay code and
+    /// call JoinRelayAsync exactly as it does for the join-by-code flow.
+    /// </summary>
+    public async Task JoinLobbyByIdAsync(string lobbyId)
+    {
+        Player player = GetPlayer();
+        Lobby lobby = await LobbyService.Instance.JoinLobbyByIdAsync(lobbyId, new JoinLobbyByIdOptions
+        {
+            Player = player
+        });
+        joinedLobby        = lobby;
+        LastLobbyCode      = lobby.LobbyCode ?? "";
+        IsHost             = false;
+        alreadyStartedGame = false; // reset so polling loop fires JoinRelayAsync
+        Debug.Log($"[LobbyManager] JoinLobbyByIdAsync succeeded — lobby: {lobby.Name}");
+        OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+    }
 
 }

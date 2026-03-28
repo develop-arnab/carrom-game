@@ -5,7 +5,6 @@ using UnityEngine;
 using TMPro;
 using Unity.Services.Authentication;
 using UnityEngine.UI;
-using Unity.Services.Friends;
 using UnityEngine.SceneManagement;
 
 public class MainMenu : Panel
@@ -43,12 +42,7 @@ public class MainMenu : Panel
     
     public override void Open()
     {
-        friendsButton.interactable = isFriendsServiceInitialized;
         UpdatePlayerNameUI();
-        if (isFriendsServiceInitialized == false)
-        {
-            InitializeFriendsServiceAsync();
-        }
         base.Open();
     }
     
@@ -89,20 +83,6 @@ public class MainMenu : Panel
         }
     }
 
-    private async void InitializeFriendsServiceAsync()
-    {
-        try
-        {
-            await FriendsService.Instance.InitializeAsync();
-            isFriendsServiceInitialized = true;
-            friendsButton.interactable = true;
-        }
-        catch (Exception exception)
-        {
-            Debug.Log(exception.Message);
-        }
-    }
-    
     private void SignOut()
     {
         ActionConfirmMenu panel = (ActionConfirmMenu)PanelManager.GetSingleton("action_confirm");
@@ -114,7 +94,6 @@ public class MainMenu : Panel
         if (result == ActionConfirmMenu.Result.Positive)
         {
             MainMenuManager.Singleton.SignOut();
-            isFriendsServiceInitialized = false;
         }
     }
     

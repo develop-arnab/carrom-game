@@ -43,10 +43,52 @@ public class FriendsMenu : Panel
     public override void Open()
     {
         base.Open();
-        // Subscribe to push notifications so the list stays live
-        FriendsService.Instance.RelationshipAdded   += OnRelationshipChanged;
-        FriendsService.Instance.RelationshipDeleted += OnRelationshipChanged;
-        LoadFriendsList();
+        // Show the panel immediately — don't block on FriendsService state.
+        // Subscribe and load list if service is ready; otherwise do it async.
+        if (IsFriendsServiceReady())
+        {
+            FriendsService.Instance.RelationshipAdded   += OnRelationshipChanged;
+            FriendsService.Instance.RelationshipDeleted += OnRelationshipChanged;
+            LoadFriendsList();
+        }
+        else
+        {
+            Debug.Log("[FriendsMenu] FriendsService not ready on Open — initializing async.");
+            InitAndOpenAsync();
+        }
+    }
+
+    private bool IsFriendsServiceReady()
+    {
+        try
+        {
+            // Accessing Friends triggers ValidateInitialized — if it throws, service isn't ready
+            _ = FriendsService.Instance.Friends;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async void InitAndOpenAsync()
+    {
+        try
+        {
+            await FriendsService.Instance.InitializeAsync();
+            // Only subscribe and load if the panel is still open after the await
+            if (IsOpen)
+            {
+                FriendsService.Instance.RelationshipAdded   += OnRelationshipChanged;
+                FriendsService.Instance.RelationshipDeleted += OnRelationshipChanged;
+                LoadFriendsList();
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[FriendsMenu] InitAndOpenAsync failed: {e.Message}");
+        }
     }
 
     public override void Close()

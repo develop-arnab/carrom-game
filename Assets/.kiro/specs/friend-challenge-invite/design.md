@@ -338,3 +338,465 @@ Each test is tagged with:
 
 Property tests and unit tests are complementary: unit tests catch concrete edge cases (empty
 input, null lobby), property tests verify the general rules hold across all inputs.
+
+
+---
+
+## Phase 2: Real-Time In-App Invite System
+
+### Overview
+
+Phase 2 replaces the out-of-band join-code sharing flow with a fully in-app UGS Lobby invite system. The host dispatches a server-side invite directly to a friend's UGS Player ID; the friend receives a real-time popup regardless of which scene they are in; accepting the popup joins the lobby by ID (no code entry required) and drops the receiver into the StartGameLobby scene.
+
+The three pillars map cleanly onto existing singletons:
+
+| Pillar | Owner | UGS API |
+|---|---|---|
+| A — Sender | `FriendsListItem` | `LobbyService.Instance.SendInviteAsync` |
+| B — Global Listener | `LobbyManager` (DontDestroyOnLoad) | `LobbyService.Instance.InviteReceived` |
+| C — Receiver UI & Resolution | `LobbyManager` → `ActionConfirmMenu` → `StartGameLobbyManager` | `LobbyService.Instance.JoinLobbyByIdAsync` |
+
+The join-by-code flow (Phase 1) is fully preserved. No new scenes are introduced.
+
+---
+
+### Architecture
+
+#### Component Diagram
+
+```mermaid
+graph TD
+    subgraph StartGameLobby Scene
+        SGLM[StartGameLobbyManager\nAutoCreatePrivateLobbyAsync]
+        LM[LobbyManager\nDontDestroyOnLoad\nInviteReceived subscriber]
+        SGM[StartGameManager\nDontDestroyOnLoad]
+    end
+
+    subgraph MainMenu Scene
+        FM[FriendsMenu\nFriendsListItem rows]
+        FLI[FriendsListItem\nInvite button]
+        ACM[ActionConfirmMenu\naccept / decline popup]
+    end
+
+    subgraph UGS Cloud
+        LS[LobbyService\nSendInviteAsync\nInviteReceived event\nJoinLobbyByIdAsync]
+    end
+
+    SGLM -->|CreateLobby isHostLobby=true| LM
+    LM -->|lobby.Id stored in joinedLobby| FLI
+    FLI -->|SendInviteAsync lobbyId + friendPlayerId| LS
+    LS -->|InviteReceived event| LM
+    LM -->|OnInviteReceived C# event| ACM
+    ACM -->|Accept: JoinLobbyByIdAsync lobbyId| LS
+    LS -->|Lobby object| LM
+    LM -->|joinedLobby set\nHandleLobbyPolling detects relay code| SGM
+    SGM -->|JoinRelayAsync| SGM
+    SGM -->|LoadScene StartGameLobby| SGLM
+```
+
+#### Sender Data Flow (Pillar A)
+
+```
+Player opens Friends panel → FriendsMenu.LoadFriendsList()
+  → each FriendsListItem.Initialize(relationship)
+      stores memberId = relationship.Member.Id   ← UGS Player ID of the friend
+
+Player taps Invite on a FriendsListItem
+  → inviteButton.interactable = false
+  → lobbyId = LobbyManager.Instance.GetJoinedLobby()?.Id
+  → GUARD: if lobbyId is null
+        inviteButton.interactable = true
+        ErrorMenu: "No active lobby. Please wait a moment and try again."
+        return
+  → await LobbyService.Instance.SendInviteAsync(lobbyId, memberId)
+      ├─ success → inviteButton.interactable = true  (invite sent; host stays in scene)
+      └─ failure → inviteButton.interactable = true
+                   ErrorMenu: "Failed to send invite."
+```
+
+#### Receiver Data Flow (Pillars B + C)
+
+```
+[Any scene — LobbyManager is always alive]
+
+LobbyManager.Start() (or post-auth hook)
+  → LobbyService.Instance.InviteReceived += OnInviteReceived
+
+UGS pushes InviteReceivedEventArgs to the receiver's client
+  → LobbyManager.OnInviteReceived(InviteReceivedEventArgs args)
+      stores pendingInviteLobbyId = args.LobbyId
+      stores pendingInviterName   = args.InviterName  (or args.InviterPlayerId as fallback)
+      raises C# event: OnInviteReceived(pendingInviteLobbyId, pendingInviterName)
+
+InviteNotificationHandler (new MonoBehaviour, lives on LobbyManager GameObject)
+  subscribes to LobbyManager.OnInviteReceived
+  → ActionConfirmMenu panel = PanelManager.GetSingleton("action_confirm")
+  → panel.Open(OnInviteResponse,
+               $"{pendingInviterName} invited you to a game. Accept?",
+               "Accept", "Decline")
+
+Player clicks Accept
+  → OnInviteResponse(Result.Positive)
+      → await LobbyManager.Instance.JoinLobbyByIdAsync(pendingInviteLobbyId)
+          ├─ success → joinedLobby set
+          │            HandleLobbyPolling detects KEY_RELAY_JOIN_CODE != ""
+          │              → alreadyStartedGame = true
+          │              → await StartGameManager.Instance.JoinRelayAsync(relayCode)
+          │              → LoadingSceneManager.Instance.LoadScene(SceneName.StartGameLobby,
+          │                                                        isNetworkSessionActive: false)
+          └─ failure → ErrorMenu: "Failed to join lobby."
+
+Player clicks Decline
+  → OnInviteResponse(Result.Negative)
+      → panel closes, pendingInviteLobbyId cleared, no lobby join
+```
+
+---
+
+### Components and Interfaces
+
+#### Pillar A — FriendsListItem.cs (modified)
+
+Replace the current `CreateLobby` call with `SendInviteAsync`. The `memberId` field already stores the friend's UGS Player ID from `Initialize(relationship)`.
+
+New Inspector fields: none — `memberId` is already populated.
+
+Key change to `InviteFriend()`:
+
+```csharp
+// Namespace required: Unity.Services.Lobbies
+private async void InviteFriend()
+{
+    inviteButton.interactable = false;
+    try
+    {
+        string lobbyId = LobbyManager.Instance.GetJoinedLobby()?.Id;
+        if (string.IsNullOrEmpty(lobbyId))
+        {
+            ErrorMenu panel = (ErrorMenu)PanelManager.GetSingleton("error");
+            panel.Open(ErrorMenu.Action.None, "No active lobby. Please wait a moment and try again.", "OK");
+            inviteButton.interactable = true;
+            return;
+        }
+        await LobbyService.Instance.SendInviteAsync(lobbyId, memberId);
+    }
+    catch (LobbyServiceException e)
+    {
+        Debug.LogError($"[FriendsListItem] SendInviteAsync failed: {e.Message}");
+        ErrorMenu panel = (ErrorMenu)PanelManager.GetSingleton("error");
+        panel.Open(ErrorMenu.Action.None, "Failed to send invite.", "OK");
+    }
+    finally
+    {
+        inviteButton.interactable = true;
+    }
+}
+```
+
+UGS namespace: `Unity.Services.Lobbies` — `LobbyService.Instance.SendInviteAsync(string lobbyId, string playerId)`.
+
+#### Pillar B — LobbyManager.cs (modified)
+
+Subscribe to `LobbyService.Instance.InviteReceived` after UGS auth is confirmed. The safest hook is a new `SetupInviteListener()` method called from `Start()` when already signed in, and also callable from `Authenticate()` after `SignInAnonymouslyAsync` completes.
+
+New members on `LobbyManager`:
+
+```csharp
+// C# event raised on the main thread for UI consumers
+public event Action<string, string> OnInviteReceived; // (lobbyId, inviterName)
+
+// Pending invite state — cleared on accept or decline
+private string _pendingInviteLobbyId;
+private string _pendingInviterName;
+
+private void SetupInviteListener()
+{
+    // Guard: only subscribe once
+    LobbyService.Instance.InviteReceived -= HandleInviteReceived;
+    LobbyService.Instance.InviteReceived += HandleInviteReceived;
+    Debug.Log("[LobbyManager] InviteReceived listener registered.");
+}
+
+// UGS SDK callback — may arrive on a background thread; marshal to main thread
+private void HandleInviteReceived(InviteReceivedEventArgs args)
+{
+    // Unity.Services.Lobbies.InviteReceivedEventArgs fields:
+    //   args.LobbyId      — string
+    //   args.InviterName  — string (display name of sender)
+    _pendingInviteLobbyId = args.LobbyId;
+    _pendingInviterName   = args.InviterName ?? args.LobbyId; // fallback if name absent
+    Debug.Log($"[LobbyManager] Invite received from '{_pendingInviterName}' for lobby {_pendingInviteLobbyId}");
+
+    // Marshal to main thread — UGS events may fire off-thread
+    MainThreadDispatcher.Enqueue(() =>
+        OnInviteReceived?.Invoke(_pendingInviteLobbyId, _pendingInviterName));
+}
+```
+
+`Start()` addition:
+
+```csharp
+private void Start()
+{
+    // ... existing code ...
+    if (UnityServices.State == ServicesInitializationState.Initialized
+        && AuthenticationService.Instance.IsSignedIn)
+    {
+        playerName = AuthenticationService.Instance.PlayerName ?? AuthenticationService.Instance.PlayerId;
+        SetupInviteListener();   // ← new
+    }
+}
+```
+
+`Authenticate()` addition — call `SetupInviteListener()` after `SignInAnonymouslyAsync` completes.
+
+UGS namespace: `Unity.Services.Lobbies` — `InviteReceivedEventArgs` is in this namespace.
+
+#### Pillar B — MainThreadDispatcher (new, minimal)
+
+UGS SDK events may fire on a background thread. A tiny dispatcher is needed to safely touch Unity UI from the callback.
+
+```csharp
+// MainThreadDispatcher.cs — attach to LobbyManager GameObject
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+public class MainThreadDispatcher : MonoBehaviour
+{
+    private static readonly Queue<Action> _queue = new Queue<Action>();
+    private static MainThreadDispatcher _instance;
+
+    public static void Enqueue(Action action)
+    {
+        lock (_queue) { _queue.Enqueue(action); }
+    }
+
+    private void Awake()
+    {
+        _instance = this;
+        DontDestroyOnLoad(gameObject);
+    }
+
+    private void Update()
+    {
+        lock (_queue)
+        {
+            while (_queue.Count > 0) _queue.Dequeue()?.Invoke();
+        }
+    }
+}
+```
+
+This component is added to the same GameObject as `LobbyManager` in the Bootstrap/MainMenu scene.
+
+#### Pillar C — InviteNotificationHandler.cs (new MonoBehaviour)
+
+Lives on the `LobbyManager` GameObject (DontDestroyOnLoad). Subscribes to `LobbyManager.OnInviteReceived` and drives the UI + join resolution.
+
+```csharp
+// InviteNotificationHandler.cs
+using Unity.Services.Lobbies;
+using Unity.Services.Lobbies.Models;
+using UnityEngine;
+
+public class InviteNotificationHandler : MonoBehaviour
+{
+    private string _pendingLobbyId;
+
+    private void OnEnable()
+    {
+        LobbyManager.Instance.OnInviteReceived += ShowInvitePopup;
+    }
+
+    private void OnDisable()
+    {
+        if (LobbyManager.Instance != null)
+            LobbyManager.Instance.OnInviteReceived -= ShowInvitePopup;
+    }
+
+    private void ShowInvitePopup(string lobbyId, string inviterName)
+    {
+        _pendingLobbyId = lobbyId;
+        ActionConfirmMenu panel = (ActionConfirmMenu)PanelManager.GetSingleton("action_confirm");
+        panel.Open(
+            OnInviteResponse,
+            $"{inviterName} invited you to a game. Accept?",
+            "Accept",
+            "Decline");
+    }
+
+    private async void OnInviteResponse(ActionConfirmMenu.Result result)
+    {
+        if (result != ActionConfirmMenu.Result.Positive)
+        {
+            _pendingLobbyId = null;
+            return;
+        }
+
+        try
+        {
+            await LobbyManager.Instance.JoinLobbyByIdAsync(_pendingLobbyId);
+            // HandleLobbyPolling in LobbyManager.Update() takes over from here:
+            // it detects KEY_RELAY_JOIN_CODE != "" and calls JoinRelayAsync + LoadScene.
+        }
+        catch (LobbyServiceException e)
+        {
+            Debug.LogError($"[InviteNotificationHandler] JoinLobbyByIdAsync failed: {e.Message}");
+            ErrorMenu panel = (ErrorMenu)PanelManager.GetSingleton("error");
+            panel.Open(ErrorMenu.Action.None, "Failed to join lobby.", "OK");
+        }
+        finally
+        {
+            _pendingLobbyId = null;
+        }
+    }
+}
+```
+
+#### Pillar C — LobbyManager.JoinLobbyByIdAsync (new public method)
+
+The existing `JoinLobby(Lobby lobby)` takes a full `Lobby` object. The invite flow only has a lobby ID. Add a new awaitable overload:
+
+```csharp
+// Unity.Services.Lobbies namespace
+public async Task JoinLobbyByIdAsync(string lobbyId)
+{
+    Player player = GetPlayer();
+    Lobby lobby = await LobbyService.Instance.JoinLobbyByIdAsync(lobbyId, new JoinLobbyByIdOptions
+    {
+        Player = player
+    });
+    joinedLobby = lobby;
+    LastLobbyCode = lobby.LobbyCode ?? "";
+    IsHost = false;
+    alreadyStartedGame = false;   // reset so HandleLobbyPolling can fire JoinRelayAsync
+    OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+}
+```
+
+The existing `HandleLobbyPolling` loop then detects `KEY_RELAY_JOIN_CODE != ""` and calls `StartGameManager.Instance.JoinRelayAsync(relayCode)`, followed by `LoadingSceneManager.Instance.LoadScene(SceneName.StartGameLobby, isNetworkSessionActive: false)`. No changes to the polling loop are required.
+
+---
+
+### Data Models
+
+No new persistent data models. The invite flow uses existing UGS types plus two transient fields on `LobbyManager`:
+
+| Field | Type | Lifetime | Purpose |
+|---|---|---|---|
+| `_pendingInviteLobbyId` | `string` | Until accept/decline | Lobby ID from `InviteReceivedEventArgs` |
+| `_pendingInviterName` | `string` | Until accept/decline | Display name from `InviteReceivedEventArgs` |
+| `InviteReceivedEventArgs.LobbyId` | `string` | UGS SDK | Lobby to join on accept |
+| `InviteReceivedEventArgs.InviterName` | `string` | UGS SDK | Shown in popup message |
+
+#### UGS SDK Types Reference
+
+| Type | Namespace | Usage |
+|---|---|---|
+| `LobbyService.Instance.SendInviteAsync(lobbyId, playerId)` | `Unity.Services.Lobbies` | Pillar A — dispatch invite |
+| `LobbyService.Instance.InviteReceived` | `Unity.Services.Lobbies` | Pillar B — subscribe to incoming invites |
+| `InviteReceivedEventArgs` | `Unity.Services.Lobbies` | Pillar B — event payload |
+| `LobbyService.Instance.JoinLobbyByIdAsync(lobbyId, options)` | `Unity.Services.Lobbies` | Pillar C — join on accept |
+| `IRelationship.Member.Id` | `Unity.Services.Friends.Models` | Pillar A — friend's UGS Player ID |
+
+---
+
+### Correctness Properties (Phase 2)
+
+*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+
+#### Property P2-1: Invite dispatches correct arguments
+
+*For any* FriendsListItem initialized with a valid `Relationship` and any active joined lobby, pressing the Invite button should result in `LobbyService.SendInviteAsync` being called with exactly `(joinedLobby.Id, relationship.Member.Id)` — no other lobby ID or player ID.
+
+**Validates: Requirements P2-A.1**
+
+---
+
+#### Property P2-2: Invite button disabled during async dispatch
+
+*For any* FriendsListItem where `SendInviteAsync` is in flight, the `inviteButton.interactable` field should be `false` for the entire duration of the async call, and `true` again after the call completes (success or failure).
+
+**Validates: Requirements P2-A.3**
+
+---
+
+#### Property P2-3: InviteReceived event propagates payload faithfully
+
+*For any* `InviteReceivedEventArgs` with a given `LobbyId` and `InviterName`, when the UGS event fires, `LobbyManager.OnInviteReceived` should be raised on the main thread with exactly those same values.
+
+**Validates: Requirements P2-B.2**
+
+---
+
+#### Property P2-4: Accept triggers join with correct lobby ID and stores result
+
+*For any* pending invite with a given `lobbyId`, when the player clicks Accept, `JoinLobbyByIdAsync` should be called with that exact `lobbyId`, and on success `LobbyManager.joinedLobby` should equal the `Lobby` object returned by the service.
+
+**Validates: Requirements P2-C.2, P2-C.3**
+
+---
+
+#### Property P2-5: Decline does not join any lobby
+
+*For any* pending invite, when the player clicks Decline, `JoinLobbyByIdAsync` should never be called and `LobbyManager.joinedLobby` should remain unchanged.
+
+**Validates: Requirements P2-C.6**
+
+---
+
+#### Property P2-6: Join failure shows error and does not load scene
+
+*For any* pending invite where `JoinLobbyByIdAsync` throws a `LobbyServiceException`, the system should open the ErrorMenu with a non-empty message and should not call `LoadingSceneManager.LoadScene`.
+
+**Validates: Requirements P2-C.7**
+
+---
+
+### Error Handling (Phase 2)
+
+| Scenario | Location | Guard | User-visible result |
+|---|---|---|---|
+| `GetJoinedLobby()` returns null when Invite pressed | `FriendsListItem.InviteFriend` | Null check before `SendInviteAsync` | ErrorMenu: "No active lobby. Please wait a moment and try again." — button re-enabled |
+| `SendInviteAsync` throws `LobbyServiceException` | `FriendsListItem.InviteFriend` catch | `LobbyServiceException` catch | ErrorMenu: "Failed to send invite." — button re-enabled via `finally` |
+| `InviteReceived` fires on background thread | `LobbyManager.HandleInviteReceived` | `MainThreadDispatcher.Enqueue` | Transparent to user — event marshalled safely |
+| `PanelManager.GetSingleton("action_confirm")` returns null | `InviteNotificationHandler.ShowInvitePopup` | Null check + `Debug.LogError` | Silent fail — invite lost; logged for debugging |
+| `JoinLobbyByIdAsync` throws (lobby full, deleted, network) | `InviteNotificationHandler.OnInviteResponse` catch | `LobbyServiceException` catch | ErrorMenu: "Failed to join lobby." — no scene load |
+| Relay code not yet written when receiver joins lobby | `LobbyManager.HandleLobbyPolling` | Existing poll loop (1.1 s interval) | Transparent — polling continues until code appears or lobby is abandoned |
+| Relay code never appears (host crashed) | `LobbyManager.HandleLobbyPolling` | Timeout after N polls (design: 30 s / ~27 polls) | `LeaveLobby()` called; ErrorMenu: "Host disconnected." |
+| Player already in a lobby when invite arrives | `InviteNotificationHandler.ShowInvitePopup` | No guard needed — popup shown regardless | Popup shown; player chooses to accept (leaves current lobby) or decline |
+
+---
+
+### Testing Strategy (Phase 2)
+
+#### Unit Tests
+
+- Verify `InviteNotificationHandler.ShowInvitePopup` sets `ActionConfirmMenu.messageText` to a string containing the inviter name.
+- Verify `InviteNotificationHandler.OnInviteResponse(Negative)` does not call `JoinLobbyByIdAsync`.
+- Verify `LobbyManager.JoinLobbyByIdAsync` sets `IsHost = false` and `alreadyStartedGame = false` on success.
+- Verify `FriendsListItem.InviteFriend` returns early with ErrorMenu when `GetJoinedLobby()` is null (edge case P2-A.2).
+- Verify `MainThreadDispatcher` executes enqueued actions on the next `Update()` tick.
+
+#### Property-Based Tests
+
+Use **FsCheck** (C#/Unity). Each test runs a minimum of **100 iterations**.
+
+Tag format: `// Feature: friend-challenge-invite, Property P2-{N}: {property_text}`
+
+| Property | Generator inputs | Assertion |
+|---|---|---|
+| P2-1: Invite dispatches correct arguments | Random `memberId` strings, random `lobbyId` strings | `SendInviteAsync` called with `(lobbyId, memberId)` — no other call |
+| P2-2: Invite button disabled during async | Random relationships, mocked delayed `SendInviteAsync` | `inviteButton.interactable == false` during await; `true` after |
+| P2-3: InviteReceived propagates payload | Random `LobbyId` + `InviterName` strings | `OnInviteReceived` fires on main thread with identical values |
+| P2-4: Accept joins correct lobby and stores result | Random `lobbyId`, mocked `Lobby` return value | `JoinLobbyByIdAsync(lobbyId)` called; `joinedLobby == returnedLobby` |
+| P2-5: Decline does not join | Random pending invite state | `JoinLobbyByIdAsync` never called; `joinedLobby` unchanged |
+| P2-6: Join failure shows error, no scene load | Random `LobbyServiceException` messages | `ErrorMenu.Open` called; `LoadScene` not called |
+
+Edge cases covered by generators:
+- P2-A.2: `GetJoinedLobby()` returns null — covered by unit test (deterministic, not property)
+- P2-B.3: `joinedLobby` non-null at time of invite — include in P2-4 generator by pre-setting `joinedLobby`
+- P2-C.5: Relay code delayed — covered by existing Property 8 generator (relay code appears after N ticks)
+
+Property tests and unit tests are complementary: unit tests cover deterministic edge cases (null lobby, null panel), property tests verify the general rules hold across all random inputs.

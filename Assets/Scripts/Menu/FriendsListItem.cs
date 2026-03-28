@@ -2,6 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using TMPro;
+using Unity.Services.Authentication;
 using Unity.Services.Friends;
 using Unity.Services.Friends.Models;
 using UnityEngine.UI;
@@ -15,32 +16,54 @@ public class FriendsListItem : MonoBehaviour
 
     private string id = "";
     private string memberId = "";
-    
+    private string memberName = "";
+
     private void Start()
     {
         inviteButton.onClick.AddListener(InviteFriend);
         // removeButton.onClick.AddListener(RemoveFriend);  // reserved for future use
     }
-    
+
     public void Initialize(Relationship relationship)
     {
-        memberId = relationship.Member.Id;
-        id = relationship.Id;
-        nameText.text = relationship.Member.Profile.Name;
+        memberId   = relationship.Member.Id;
+        memberName = relationship.Member.Profile.Name;
+        id         = relationship.Id;
+        nameText.text = memberName;
     }
-    
-    private void InviteFriend()
+
+    // ── Pillar A: dispatch a lobby invite message to this friend ─────────────
+
+    private async void InviteFriend()
     {
         inviteButton.interactable = false;
         try
         {
-            LobbyManager.Instance.CreateLobby("Carrom", 2, true, LobbyManager.GameMode.Carrom);
+            string lobbyId = LobbyManager.Instance.GetJoinedLobby()?.Id;
+            if (string.IsNullOrEmpty(lobbyId))
+            {
+                ErrorMenu errorPanel = (ErrorMenu)PanelManager.GetSingleton("error");
+                errorPanel.Open(ErrorMenu.Action.None, "No active lobby. Please wait a moment and try again.", "OK");
+                return;
+            }
+
+            string inviterName = AuthenticationService.Instance.PlayerName
+                              ?? AuthenticationService.Instance.PlayerId
+                              ?? "A friend";
+
+            var message = new LobbyInviteMessage(lobbyId, inviterName);
+            await FriendsService.Instance.MessageAsync(memberId, message);
+            Debug.Log($"[FriendsListItem] Invite sent to '{memberName}' ({memberId}) for lobby {lobbyId}");
         }
-        catch
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[FriendsListItem] MessageAsync failed: {e.Message}");
+            ErrorMenu errorPanel = (ErrorMenu)PanelManager.GetSingleton("error");
+            errorPanel.Open(ErrorMenu.Action.None, "Failed to send invite.", "OK");
+        }
+        finally
         {
             inviteButton.interactable = true;
-            ErrorMenu panel = (ErrorMenu)PanelManager.GetSingleton("error");
-            panel.Open(ErrorMenu.Action.None, "Failed to create lobby.", "OK");
         }
     }
 
@@ -61,5 +84,5 @@ public class FriendsListItem : MonoBehaviour
         }
     }
     */
-    
+
 }
