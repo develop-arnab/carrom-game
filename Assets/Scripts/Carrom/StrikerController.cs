@@ -18,7 +18,7 @@ public class StrikerController : NetworkBehaviour
     bool isMoving;
     bool isCharging;
     bool isDragging;          // true while finger/mouse is locked onto the striker
-    float maxForceMagnitude = 30f;
+    [SerializeField] float maxForceMagnitude = 30f;
     Rigidbody2D rb;
     AudioSource audioSource;
 
@@ -38,6 +38,7 @@ public class StrikerController : NetworkBehaviour
 
     private void Start()
     {
+        _instance    = this;
         playerTurn   = true;
         rb           = GetComponent<Rigidbody2D>();
         audioSource  = GetComponent<AudioSource>();
@@ -123,9 +124,21 @@ public class StrikerController : NetworkBehaviour
         ResetToBaseline(seatIndex);
     }
 
+    // ── Rail position tuning — exposed to Inspector ───────────────────────────
     // East/West rail X positions for seats 1 and 3
-    [SerializeField] float eastRailX =  4.57f;
-    [SerializeField] float westRailX = -4.57f;
+    [SerializeField] float eastRailX  =  4.57f;
+    [SerializeField] float westRailX  = -4.57f;
+    // South/North baseline Y positions for seats 0 and 2
+    [SerializeField] float southRailY = -4.57f;
+    [SerializeField] float northRailY =  3.45f;
+
+    // ── Static accessors so BoardScript.GetBaseline can read tunable rail positions ──
+    public static float SouthRailY => _instance != null ? _instance.southRailY : -4.57f;
+    public static float NorthRailY => _instance != null ? _instance.northRailY :  3.45f;
+    public static float EastRailX  => _instance != null ? _instance.eastRailX  :  4.57f;
+    public static float WestRailX  => _instance != null ? _instance.westRailX  : -4.57f;
+
+    private static StrikerController _instance;
 
     /// <summary>
     /// Seat-aware baseline reset. Seat 0 (South) and 2 (North) use Y-axis positioning;
@@ -153,11 +166,11 @@ public class StrikerController : NetworkBehaviour
 
         switch (seatIndex)
         {
-            case 0: SetPosition(sliderVal,  -4.57f); break;  // South — X-axis movement
-            case 1: SetPosition(eastRailX,  sliderVal); break; // East  — Y-axis movement
-            case 2: SetPosition(sliderVal,   3.45f); break;  // North — X-axis movement
-            case 3: SetPosition(westRailX,  sliderVal); break; // West  — Y-axis movement
-            default: SetPosition(sliderVal, -4.57f); break;
+            case 0: SetPosition(sliderVal,  southRailY); break;  // South — X-axis movement
+            case 1: SetPosition(eastRailX,  sliderVal); break;   // East  — Y-axis movement
+            case 2: SetPosition(sliderVal,  northRailY); break;  // North — X-axis movement
+            case 3: SetPosition(westRailX,  sliderVal); break;   // West  — Y-axis movement
+            default: SetPosition(sliderVal, southRailY); break;
         }
 
         // Broadcast starting position
@@ -180,7 +193,7 @@ public class StrikerController : NetworkBehaviour
             SpriteRenderer sr = GetComponent<SpriteRenderer>();
             if (sr != null) sr.enabled = true;
             float x = strikerSlider != null ? strikerSlider.value : 0f;
-            SetPosition(x, -4.57f);
+            SetPosition(x, southRailY);
             return;
         }
 
@@ -253,7 +266,7 @@ public class StrikerController : NetworkBehaviour
             RaycastHit2D hit = Physics2D.Raycast(worldPos, Vector2.zero);
             if (hit.collider == null || hit.collider.gameObject != gameObject) return;
 
-            float correctY = (!IsSpawned || IsServer) ? -4.57f : 3.45f;
+            float correctY = (!IsSpawned || IsServer) ? southRailY : northRailY;
             if (Mathf.Abs(transform.position.y - correctY) > 0.01f)
                 transform.position = new Vector3(transform.position.x, correctY, 0);
 

@@ -56,7 +56,8 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
     [SerializeField] private TextMeshProUGUI joinCodeText;
 
     [Header("Scene")]
-    [SerializeField] private SceneName nextScene = SceneName.Carrom;
+    [SerializeField] private SceneName classicScene   = SceneName.Carrom;
+    [SerializeField] private SceneName freestyleScene = SceneName.CarromNew;
 
     // ── Network State ─────────────────────────────────────────────────────────
 
@@ -129,7 +130,11 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
 
     private async void Start()
     {
-        // Step 1: Wire up UI that doesn't need auth first — instant, no blocking.
+        // ── Step 1: Unconditional UI wiring ──────────────────────────────────
+        // This MUST run on every load — first boot AND rematch — because Unity
+        // destroys and recreates all scene objects (including Button onClick lists)
+        // on every scene transition. Skipping this leaves buttons dead.
+
         if (gameModeDropdown != null)
         {
             gameModeDropdown.value = (int)_localGameMode;
@@ -143,16 +148,32 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
         }
 
         ApplyPlayerCountToUI(_localPlayerCount);
-        ResetAllSlotsToWaiting();
 
-        // Only MATCH and Start are still relevant — Online/Invite are deprecated.
-        if (matchButton != null) matchButton.onClick.AddListener(OnMatchClicked);
+        // Only reset slots on offline first boot — during a rematch, OnNetworkSpawn
+        // handles the reset so we don't wipe freshly synced network UI.
+        if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsListening)
+            ResetAllSlotsToWaiting();
+
+        if (matchButton         != null) matchButton.onClick.AddListener(OnMatchClicked);
+        if (inviteFriendsButton != null) inviteFriendsButton.onClick.AddListener(OnInviteFriendsClicked);
         if (startGameButton != null && startGameButton.TryGetComponent<Button>(out var startBtn))
             startBtn.onClick.AddListener(OnStartGameClicked);
 
-        SetButtonVisibility(isHost: false, isSpawned: false);
+        // Only hide buttons when offline — during a rematch OnNetworkSpawn already
+        // set the correct visibility and Start() must not override it.
+        if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsListening)
+            SetButtonVisibility(isHost: false, isSpawned: false);
 
-        // Step 2: Authenticate — awaited so PlayerName is ready before slot population.
+        // ── Step 2: Guard — skip network boot during a rematch ───────────────
+        // OnNetworkSpawn handles everything for the active-session path.
+        // Only the UGS auth + AutoCreatePrivateLobbyAsync calls must be skipped.
+        if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsListening)
+        {
+            Debug.Log("[StartGameLobbyManager] Start() — NGO already listening (rematch). Skipping network boot.");
+            return;
+        }
+
+        // ── Step 3: Authenticate (offline / first load only) ─────────────────
         try
         {
             await InitializeNetworkServices();
@@ -163,11 +184,10 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
             Debug.LogWarning($"[StartGameLobbyManager] UGS init on Start failed: {e.Message}");
         }
 
-        // Step 3: Populate local slot immediately — offline, no network dependency.
+        // Step 4: Populate local slot immediately — offline, no network dependency.
         InitHostSlot();
 
-        // Step 4: Kick off the private lobby creation in the background.
-        // Fire-and-forget: does NOT block the rest of the UI or scene animations.
+        // Step 5: Kick off the private lobby creation in the background.
         if (joinCodeText != null) joinCodeText.text = "Generating Code...";
         _ = AutoCreatePrivateLobbyAsync();
     }
@@ -296,6 +316,25 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
     [ServerRpc(RequireOwnership = false)]
     private void ReportClientNameServerRpc(string playerName, ServerRpcParams rpcParams = default)
     {
+        ulong senderId = rpcParams.Receive.SenderClientId;
+
+        // ── Step C: Sync existing slots to the checking-in client ────────────
+        // Before assigning this client's slot, push all already-occupied slots
+        // down to them so they see the host (and any other players) immediately.
+        ClientRpcParams toSender = new ClientRpcParams
+        {
+            Send = new ClientRpcSendParams { TargetClientIds = new[] { senderId } }
+        };
+        for (int i = 0; i < _slotNames.Length; i++)
+        {
+            if (!string.IsNullOrEmpty(_slotNames[i]))
+            {
+                Debug.Log($"[StartGameLobbyManager] Syncing existing slot {i} ('{_slotNames[i]}') → client {senderId}");
+                SyncSlotToClientRpc(i, _slotNames[i], toSender);
+            }
+        }
+
+        // Now find a vacant slot and assign this client
         int slot = FindNextVacantSlot();
         if (slot < 0)
         {
@@ -488,8 +527,18 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
 
     public override void OnNetworkSpawn()
     {
+        // Clear stale visual state for both Host and Client before repopulating via RPCs.
+        // This runs before the if (IsServer) block so both sides start from a clean slate.
+        ResetAllSlotsToWaiting();
+
         if (IsServer)
         {
+            // Reset ready states and bot count — this scene may be loading as a rematch,
+            // so we must clear votes from the previous match to prevent an instant auto-start.
+            _readyStates.Clear();
+            CarromGameManager.PendingBotCount = 0;
+            Debug.Log("[StartGameLobbyManager] OnNetworkSpawn — ready states and bot count reset for fresh lobby.");
+
             netCarromRuleset.Value = _localGameMode;
 
             NetworkManager.Singleton.OnClientConnectedCallback  += OnClientConnected;
@@ -502,9 +551,28 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
             if (playerCountDropdown != null) playerCountDropdown.interactable = true;
 
             SetButtonVisibility(isHost: true, isSpawned: true);
+
+            // Hard reset slot name array — clears ghost strings from the previous match
+            for (int i = 0; i < _slotNames.Length; i++) _slotNames[i] = "";
+
+            // Populate host slot immediately
+            InitHostSlot();
+
+            // ── Step A: Server does NOT re-ping clients here ──────────────────
+            // NGO loads the server before clients finish loading the scene.
+            // Any RPC fired here would be dropped by clients still in transition.
+            // Instead, clients use the Client-Driven Check-In pattern (see else block):
+            // each client proactively sends its name via ReportClientNameServerRpc
+            // once its own OnNetworkSpawn fires.
+            // Auto-ready all currently connected clients so the Start button unlocks.
+            foreach (ulong clientId in NetworkManager.Singleton.ConnectedClientsIds)
+            {
+                if (clientId == NetworkManager.ServerClientId) continue;
+                _readyStates[clientId] = true;
+            }
+
+            // Refresh after populating ready states
             RefreshStartButtonState();
-            // Flow A is handled in Start() — slot 0 is already populated offline.
-            // No InitHostSlot() call needed here.
         }
         else
         {
@@ -512,6 +580,17 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
             if (playerCountDropdown != null) playerCountDropdown.interactable = false;
 
             SetButtonVisibility(isHost: false, isSpawned: true);
+
+            // ── Step B: Client-Driven Check-In ────────────────────────────────
+            // The client proactively sends its name to the server the moment its
+            // own OnNetworkSpawn fires — guaranteeing the scene is fully loaded
+            // before the RPC is sent. This avoids the race condition where the
+            // server fires RPCs at clients who haven't finished loading yet.
+            string localName = AuthenticationService.Instance.PlayerName
+                            ?? AuthenticationService.Instance.PlayerId
+                            ?? "Player";
+            Debug.Log($"[StartGameLobbyManager] Client check-in — reporting name: '{localName}'");
+            ReportClientNameServerRpc(localName);
         }
 
         netCarromRuleset.OnValueChanged += (_, newMode) =>
@@ -560,9 +639,13 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
     private void RefreshStartButtonState()
     {
         if (!IsServer || startGameButton == null) return;
+        // On rematch, _readyStates has false entries for connected clients.
+        // The host can always start — clients are already in the session.
+        // Button is enabled when: no clients tracked (solo/bot game) OR all tracked clients are ready.
         bool allReady = _readyStates.Count == 0 || _readyStates.Values.All(v => v);
         if (startGameButton.TryGetComponent<Button>(out var btn))
             btn.interactable = allReady;
+        Debug.Log($"[StartGameLobbyManager] RefreshStartButtonState — readyCount={_readyStates.Count}, allReady={allReady}");
     }
 
     // ── Game Start ────────────────────────────────────────────────────────────
@@ -572,8 +655,26 @@ public class StartGameLobbyManager : SingletonNetwork<StartGameLobbyManager>
         InjectGhostBots();
         CarromGameManager.ActiveRuleset = netCarromRuleset.Value;
         Debug.Log($"[StartGameLobbyManager] Starting — ruleset: {CarromGameManager.ActiveRuleset}");
+
+        // Route to the correct scene based on ruleset:
+        // Classic → classicScene (Carrom), Freestyle → freestyleScene (CarromNew)
+        SceneName targetScene = CarromGameManager.ActiveRuleset == GameMode.Classic
+            ? classicScene
+            : freestyleScene;
+
+        Debug.Log($"[StartGameLobbyManager] Target scene: {targetScene}");
         StartGameClientRpc();
-        LoadingSceneManager.Instance.LoadScene(nextScene);
+
+        if (IsSpawned && NetworkManager.Singleton != null && NetworkManager.Singleton.IsListening)
+        {
+            NetworkManager.Singleton.SceneManager.LoadScene(
+                targetScene.ToString(),
+                UnityEngine.SceneManagement.LoadSceneMode.Single);
+        }
+        else
+        {
+            LoadingSceneManager.Instance.LoadScene(targetScene);
+        }
     }
 
     private void InjectGhostBots()

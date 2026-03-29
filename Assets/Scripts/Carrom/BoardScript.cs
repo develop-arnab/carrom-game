@@ -193,16 +193,16 @@ public class BoardScript : NetworkBehaviour
     {
         switch (seatIndex)
         {
-            case 0: // South — horizontal, Y = -4.57f
-                return new BaselineData { isHorizontal = true,  fixedAxis = -4.57f, rangeMin = -3f, rangeMax = 3f };
-            case 1: // East  — vertical, X = 4.57f
-                return new BaselineData { isHorizontal = false, fixedAxis =  4.57f, rangeMin = -3f, rangeMax = 3f };
-            case 2: // North — horizontal, Y = 3.45f
-                return new BaselineData { isHorizontal = true,  fixedAxis =  3.45f, rangeMin = -3f, rangeMax = 3f };
-            case 3: // West  — vertical, X = -4.57f
-                return new BaselineData { isHorizontal = false, fixedAxis = -4.57f, rangeMin = -3f, rangeMax = 3f };
-            default: // fallback to seat 0
-                return new BaselineData { isHorizontal = true,  fixedAxis = -4.57f, rangeMin = -3f, rangeMax = 3f };
+            case 0: // South — horizontal, Y fixed
+                return new BaselineData { isHorizontal = true,  fixedAxis = StrikerController.SouthRailY, rangeMin = -3f, rangeMax = 3f };
+            case 1: // East  — vertical, X fixed
+                return new BaselineData { isHorizontal = false, fixedAxis = StrikerController.EastRailX,  rangeMin = -3f, rangeMax = 3f };
+            case 2: // North — horizontal, Y fixed
+                return new BaselineData { isHorizontal = true,  fixedAxis = StrikerController.NorthRailY, rangeMin = -3f, rangeMax = 3f };
+            case 3: // West  — vertical, X fixed
+                return new BaselineData { isHorizontal = false, fixedAxis = StrikerController.WestRailX,  rangeMin = -3f, rangeMax = 3f };
+            default:
+                return new BaselineData { isHorizontal = true,  fixedAxis = StrikerController.SouthRailY, rangeMin = -3f, rangeMax = 3f };
         }
     }
 

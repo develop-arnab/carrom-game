@@ -314,7 +314,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d5a57f767e5e46a458fc5d3c628d0cbb, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  GlobalObjectIdHash: 3986013190
+  GlobalObjectIdHash: 2026019644
   InScenePlacedSourceGlobalObjectIdHash: 0
   DeferredDespawnTick: 0
   Ownership: 1
@@ -347,6 +347,9 @@ MonoBehaviour:
   visualLengthMultiplier: 2.5
   aimDeadzone: 0.2
   aimSmoothSpeed: 15
+  maxForceMagnitude: 30
+  eastRailX: 4.57
+  westRailX: -4.57
 --- !u!58 &8536452893684715782
 CircleCollider2D:
   m_ObjectHideFlags: 0

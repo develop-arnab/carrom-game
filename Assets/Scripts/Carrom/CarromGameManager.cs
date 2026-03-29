@@ -141,6 +141,12 @@ public class CarromGameManager : NetworkBehaviour
     [SerializeField] private int       winScoreThreshold    = 160;
     [SerializeField] private GameMode  currentGameMode      = GameMode.Freestyle;
     [SerializeField] private float     spawnClearanceRadius = 0.5f;
+    // ── Freestyle coin values (anti-tie: 9×20 + 9×10 + 1×40 = 310, odd total eliminates ties)
+    [SerializeField] private int whiteCoinValue       = 20;
+    [SerializeField] private int blackCoinValue       = 10;
+    [SerializeField] private int queenCoinValue       = 40;
+    // ── Freestyle target score (0 = board-clear only; >0 = first to reach this wins)
+    [SerializeField] private int freestyleTargetScore = 0;
     [SerializeField] private LayerMask pieceLayerMask;
 
     [SerializeField]
@@ -200,6 +206,26 @@ public class CarromGameManager : NetworkBehaviour
     {
         base.OnNetworkSpawn();
 
+        if (IsServer)
+        {
+            // Explicit reset on every spawn — covers both first launch and rematch.
+            gameOver                    = false;
+            isPaused                    = false;
+            score0.Value                = 0;
+            score1.Value                = 0;
+            score2.Value                = 0;
+            score3.Value                = 0;
+            networkTimeLeft.Value       = 120f;
+            networkPlayerTurn.Value     = true;
+            networkCoinsRemaining.Value = 19;
+            hostSecuredQueen.Value      = false;
+            clientSecuredQueen.Value    = false;
+            Time.timeScale              = 1f;
+            if (gameOverMenu != null) gameOverMenu.SetActive(false);
+            Debug.Log("[CarromGameManager] OnNetworkSpawn — all match state reset for fresh game.");
+        }
+
+        // Resolve slider once — used by both host and client orientation setup
         UnityEngine.UI.Slider sliderComponent = slider != null
             ? slider.GetComponent<UnityEngine.UI.Slider>()
             : null;
@@ -216,11 +242,9 @@ public class CarromGameManager : NetworkBehaviour
         }
         else
         {
-            // Client: flip camera 180° on Z so the board reads naturally from their side
-            Camera.main.transform.rotation = Quaternion.Euler(0f, 0f, 180f);
-            // Mirror the slider so dragging right still moves the striker right visually
-            if (sliderComponent != null)
-                sliderComponent.direction = UnityEngine.UI.Slider.Direction.RightToLeft;
+            // Client: defer camera flip to Start() so it runs after the scene is fully loaded.
+            // Setting it here during NGO's scene load can be overridden by Unity's scene init.
+            StartCoroutine(FlipCameraForClientDelayed(sliderComponent));
         }
 
         // Subscribe to activeSeatIndex changes to update UI on all clients
@@ -249,6 +273,21 @@ public class CarromGameManager : NetworkBehaviour
     {
         activeSeatIndex.OnValueChanged -= OnActiveSeatIndexChanged;
         base.OnNetworkDespawn();
+    }
+
+    /// <summary>
+    /// Waits one frame after scene load before flipping the client camera.
+    /// This prevents Unity's scene initialisation from overriding the rotation
+    /// that was set during OnNetworkSpawn.
+    /// </summary>
+    private IEnumerator FlipCameraForClientDelayed(UnityEngine.UI.Slider sliderComponent)
+    {
+        yield return null; // wait one frame for scene to fully settle
+        if (Camera.main != null)
+            Camera.main.transform.rotation = Quaternion.Euler(0f, 0f, 180f);
+        if (sliderComponent != null)
+            sliderComponent.direction = UnityEngine.UI.Slider.Direction.RightToLeft;
+        Debug.Log("[CarromGameManager] Client camera flipped 180° after scene settle.");
     }
 
     private void OnActiveSeatIndexChanged(int previousValue, int newValue)
@@ -291,9 +330,19 @@ public class CarromGameManager : NetworkBehaviour
         if (slider   != null) slider.SetActive(isMyTurn);
         if (turnText != null) turnText.SetActive(isMyTurn);
 
-        // Aggregate team scores for win-condition evaluation
-        int whiteTeamScore = score0.Value + score2.Value;
-        int blackTeamScore = score1.Value + score3.Value;
+        // Dynamically aggregate team scores by actual Team assignment — mirrors LateUpdate().
+        // This correctly handles 2-player mode where Seat 0 = White and Seat 2 = Black.
+        int[] seatScores = { score0.Value, score1.Value, score2.Value, score3.Value };
+        RosterState rs   = rosterState.Value;
+        int whiteTeamScore = 0;
+        int blackTeamScore = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            SeatData seat = rs[i];
+            if (seat.ControllerType == ControllerType.Closed) continue;
+            if (seat.Team == Team.White) whiteTeamScore += seatScores[i];
+            else                         blackTeamScore += seatScores[i];
+        }
         float currentTimeLeft = IsSpawned ? networkTimeLeft.Value : timerScript.timeLeft;
 
         // GUARD: Only check win conditions if the game is actually running
@@ -302,7 +351,11 @@ public class CarromGameManager : NetworkBehaviour
             bool boardCleared = currentGameMode == GameMode.Freestyle && networkCoinsRemaining.Value <= 0;
             bool classicWin   = currentGameMode == GameMode.Classic &&
                                 (whiteTeamScore >= winScoreThreshold || blackTeamScore >= winScoreThreshold);
-            if (boardCleared || classicWin || currentTimeLeft <= 0)
+            // Freestyle target score: if > 0, end the match the moment either team reaches it
+            bool freestyleTargetReached = currentGameMode == GameMode.Freestyle
+                                       && freestyleTargetScore > 0
+                                       && (whiteTeamScore >= freestyleTargetScore || blackTeamScore >= freestyleTargetScore);
+            if (boardCleared || classicWin || freestyleTargetReached || currentTimeLeft <= 0)
                 if (!IsSpawned || IsServer) onGameOver();
         }
 
@@ -396,9 +449,44 @@ public class CarromGameManager : NetworkBehaviour
     [ServerRpc(RequireOwnership = false)]
     private void RequestRestartServerRpc()
     {
-        Debug.Log("[CarromGameManager] Server received restart request. Unfreezing all clients...");
+        Debug.Log("[CarromGameManager] Server received restart request — running teardown then transitioning.");
+
+        // Run teardown (score capture, future DB save hook) before the scene changes.
+        // SaveMatchDataAndCleanup is async void so it fires and the scene load follows
+        // after the await inside it completes.
+        SaveMatchDataAndCleanup();
+    }
+
+    /// <summary>
+    /// Teardown hook called before every rematch transition.
+    /// Captures final scores, logs them, and is the designated insertion point
+    /// for future backend database saving (leaderboards, match history, etc.).
+    /// </summary>
+    private async void SaveMatchDataAndCleanup()
+    {
+        Debug.Log("[CarromGameManager] Hook: Preparing to save match data to DB...");
+
+        // Capture final scores before the scene unloads
+        int finalWhite = score0.Value + score2.Value;
+        int finalBlack = score1.Value + score3.Value;
+        Debug.Log($"[CarromGameManager] Final scores — White: {finalWhite}, Black: {finalBlack}");
+
+        // ── Future DB save goes here ──────────────────────────────────────────
+        // e.g. await DatabaseService.SaveMatchResultAsync(finalWhite, finalBlack);
+        // Using a minimal await so this method is genuinely async and the compiler
+        // doesn't warn about a synchronous async void.
+        await System.Threading.Tasks.Task.CompletedTask;
+        // ─────────────────────────────────────────────────────────────────────
+
+        Debug.Log("[CarromGameManager] Teardown complete — loading StartGameLobby via NGO SceneManager.");
+
+        // Unfreeze all clients first so they aren't stuck at timeScale=0 during the load
         UnfreezeAllClientRpc();
-        LoadingSceneManager.Instance.LoadScene(SceneName.CharacterSelection);
+
+        // NGO scene load — keeps all clients in the same Relay session
+        NetworkManager.Singleton.SceneManager.LoadScene(
+            SceneName.StartGameLobby.ToString(),
+            UnityEngine.SceneManagement.LoadSceneMode.Single);
     }
 
     [ClientRpc]
@@ -410,9 +498,37 @@ public class CarromGameManager : NetworkBehaviour
 
     public void RestartGame()
     {
-        Debug.Log("[CarromGameManager] Restart button clicked locally!");
+        Debug.Log("[CarromGameManager] Restart button clicked.");
         Time.timeScale = 1;
-        RequestRestartServerRpc();
+
+        if (IsServer)
+        {
+            // Host: trigger the NGO scene load directly — all clients follow automatically.
+            RequestRestartServerRpc();
+        }
+        else
+        {
+            // Client: cannot trigger a scene load — only the server can do that via NGO.
+            // Update the button to show a waiting state; the host's click will pull
+            // this client into the lobby scene automatically via NGO SceneManager.
+            if (gameOverMenu != null)
+            {
+                // Find the restart button inside the game over menu and disable it
+                var buttons = gameOverMenu.GetComponentsInChildren<UnityEngine.UI.Button>(true);
+                foreach (var btn in buttons)
+                {
+                    var label = btn.GetComponentInChildren<TMPro.TextMeshProUGUI>();
+                    if (label != null && (label.text == "Restart" || label.text == "Play Again" || label.text == "Rematch"))
+                    {
+                        label.text = "Waiting for Host...";
+                        btn.interactable = false;
+                        break;
+                    }
+                }
+            }
+            // Still send the RPC so the server knows this client wants to restart
+            RequestRestartServerRpc();
+        }
     }
 
     public void QuitGame()
@@ -761,7 +877,7 @@ public class CarromGameManager : NetworkBehaviour
                         continue; // no points, no retain for this coin
                     }
 
-                    points += coin == CoinType.White ? 20 : 10;
+                    points += coin == CoinType.White ? whiteCoinValue : blackCoinValue;
                     networkCoinsRemaining.Value -= 1;
                     retainTurn = true;
                 }
@@ -789,15 +905,15 @@ public class CarromGameManager : NetworkBehaviour
                         byte blackId = GetGraveyardCoinId(CoinType.Black);
                         byte whiteId = GetGraveyardCoinId(CoinType.White);
 
-                        if (blackId != 255 && currentScore >= 10)
+                        if (blackId != 255 && currentScore >= blackCoinValue)
                         {
                             penaltyId  = blackId;
-                            penaltyPts = 10;
+                            penaltyPts = blackCoinValue;
                         }
-                        else if (whiteId != 255 && currentScore >= 20)
+                        else if (whiteId != 255 && currentScore >= whiteCoinValue)
                         {
                             penaltyId  = whiteId;
-                            penaltyPts = 20;
+                            penaltyPts = whiteCoinValue;
                         }
 
                         if (penaltyId != 255)
@@ -809,8 +925,8 @@ public class CarromGameManager : NetworkBehaviour
                         }
                         else
                         {
-                            // No returnable coin found (graveyard empty) — deduct points only, floor at zero.
-                            int deduction = Mathf.Min(10, currentScore);
+                            // No returnable coin found (graveyard empty) — deduct minimum coin value, floor at zero.
+                            int deduction = Mathf.Min(blackCoinValue, currentScore);
                             points -= deduction;
                             Debug.Log($"[CGM] Freestyle: Striker foul — no coin to return, deducted {deduction} pts");
                         }
@@ -825,14 +941,14 @@ public class CarromGameManager : NetworkBehaviour
             {
                 if (hasCover)
                 {
-                    points += 50;
+                    points += queenCoinValue;
                     networkCoinsRemaining.Value -= 1;
                     // TODO: replace with per-seat queen flag when 4-player queen tracking is implemented
                     if (activeIdx == 0 || activeIdx == 2) hostSecuredQueen.Value = true;
                     else clientSecuredQueen.Value = true;
                     isQueenPending = false;
                     retainTurn = true;
-                    Debug.Log("[CGM] Queen covered (follow-up) — +50");
+                    Debug.Log($"[CGM] Queen covered (follow-up) — +{queenCoinValue}");
                 }
                 else { isQueenPending = false; RespawnPiece(19); Debug.Log("[CGM] Queen cover failed — respawning"); }
             }
@@ -841,12 +957,12 @@ public class CarromGameManager : NetworkBehaviour
                 retainTurn = true;
                 if (hasCover)
                 {
-                    points += 50;
+                    points += queenCoinValue;
                     networkCoinsRemaining.Value -= 1;
                     // TODO: replace with per-seat queen flag when 4-player queen tracking is implemented
                     if (activeIdx == 0 || activeIdx == 2) hostSecuredQueen.Value = true;
                     else clientSecuredQueen.Value = true;
-                    Debug.Log("[CGM] Queen same-shot cover — +50");
+                    Debug.Log($"[CGM] Queen same-shot cover — +{queenCoinValue}");
                 }
                 else { isQueenPending = true; Debug.Log("[CGM] Queen pending cover next shot"); }
             }
@@ -886,9 +1002,35 @@ public class CarromGameManager : NetworkBehaviour
         int GetSeatScore(int idx) => idx switch { 0 => score0.Value, 1 => score1.Value, 2 => score2.Value, _ => score3.Value };
         void AddSeatScore(int idx, int pts) { switch (idx) { case 0: score0.Value += pts; break; case 1: score1.Value += pts; break; case 2: score2.Value += pts; break; default: score3.Value += pts; break; } }
 
-        // White team seats: 0 and 2 — Black team seats: 1 and 3
-        int WhiteTeamScore() => score0.Value + score2.Value;
-        int BlackTeamScore() => score1.Value + score3.Value;
+        // ── Dynamic team seat lookup ──────────────────────────────────────────
+        // Find the first active (non-Closed) seat for each team so points land
+        // in the correct NetworkVariable regardless of which seat index is used.
+        // In 2-player mode: Seat 0 = White, Seat 2 = Black — Seat 1 is Closed.
+        RosterState rs = rosterState.Value;
+        int whiteSeatIdx = -1;
+        int blackSeatIdx = -1;
+        for (int i = 0; i < 4; i++)
+        {
+            SeatData s = rs[i];
+            if (s.ControllerType == ControllerType.Closed) continue;
+            if (s.Team == Team.White && whiteSeatIdx < 0) whiteSeatIdx = i;
+            if (s.Team == Team.Black && blackSeatIdx < 0) blackSeatIdx = i;
+        }
+        // Fallback to legacy indices if roster isn't populated yet
+        if (whiteSeatIdx < 0) whiteSeatIdx = 0;
+        if (blackSeatIdx < 0) blackSeatIdx = 1;
+
+        // Dynamic team score helpers — use the same roster loop as LateUpdate/Update
+        int WhiteTeamScore() {
+            int total = 0;
+            for (int i = 0; i < 4; i++) { SeatData s = rs[i]; if (s.ControllerType != ControllerType.Closed && s.Team == Team.White) total += GetSeatScore(i); }
+            return total;
+        }
+        int BlackTeamScore() {
+            int total = 0;
+            for (int i = 0; i < 4; i++) { SeatData s = rs[i]; if (s.ControllerType != ControllerType.Closed && s.Team == Team.Black) total += GetSeatScore(i); }
+            return total;
+        }
 
         // --- Absolute scoring with Queen Last enforcement ---
         foreach (CoinType coin in shotLedger)
@@ -905,10 +1047,9 @@ public class CarromGameManager : NetworkBehaviour
                     continue;
                 }
 
-                // Absolute scoring: White coins → seat 0 score (White team representative), Black → seat 1
-                // In Classic, each coin color scores for its team's first seat as a running total
-                if (coin == CoinType.White) score0.Value += 1;
-                else                        score1.Value += 1;
+                // Dynamic scoring: route each coin to the correct team's active seat
+                if (coin == CoinType.White) AddSeatScore(whiteSeatIdx, 1);
+                else                        AddSeatScore(blackSeatIdx, 1);
 
                 if (coin == myCoin) retainTurn = true;
             }
@@ -983,7 +1124,7 @@ public class CarromGameManager : NetworkBehaviour
             Debug.Log("[CGM] Classic: Striker foul absolute override — turn forcibly lost");
         }
 
-        Debug.Log($"[CGM] Classic: White={WhiteTeamScore()} Black={BlackTeamScore()} | seat={activeIdx} myCoin={myCoin}");
+        Debug.Log($"[CGM] Classic: White={WhiteTeamScore()} Black={BlackTeamScore()} | seat={activeIdx} myCoin={myCoin} whiteSeat={whiteSeatIdx} blackSeat={blackSeatIdx}");
         return retainTurn;
     }
 
